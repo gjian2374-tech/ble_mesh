@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.ble_mesh.ble_mesh">
+
+    <!-- ====================================================================
+         蓝牙权限声明
+         Android 12 (API 31) 及以上使用新的细粒度蓝牙权限
+         Android 11 (API 30) 及以下使用旧权限 + 位置权限
+         ==================================================================== -->
+
+    <!-- Android 11 及以下：蓝牙基础权限 -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!-- Android 12 及以上：扫描附近蓝牙设备。
+         neverForLocation 表明本应用不会使用 BLE 扫描结果推断位置，
+         这样在 Android 12+ 上无需开启系统位置服务也能正常扫描。 -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+
+    <!-- Android 12 及以上：连接蓝牙设备（包括 GATT 操作） -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- 扫描时需要位置权限（Android 6.0 - 11） -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- ====================================================================
+         硬件特性声明（非强制要求，用于 Play Store 过滤）
+         ==================================================================== -->
+
+    <!-- 声明需要 BLE 支持 -->
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="true" />
+
+</manifest>
