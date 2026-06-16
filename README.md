@@ -1,27 +1,27 @@
 # ble_mesh
 
-一个 Flutter BLE Mesh 插件，在 **Android** 与 **iOS** 上均基于 [Nordic nRF Mesh Library](https://www.nordicsemi.com/Products/Development-software/nRF-Mesh) 实现真实 PB-GATT 配网、Proxy 连接、配置消息与加密控制，目标为双端行为一致。
+A Flutter BLE Mesh plugin that implements real PB-GATT provisioning, Proxy connections, configuration messages, and encrypted control on **Android** and **iOS**, both built on the [Nordic nRF Mesh Library](https://www.nordicsemi.com/Products/Development-software/nRF-Mesh), with consistent behavior across platforms.
 
-## 功能概览
+## Feature Overview
 
-| 功能 | Android | iOS | 说明 |
+| Feature | Android | iOS | Notes |
 |------|---------|-----|------|
-| 初始化与权限 | ✅ | ✅ | 加载/创建 Mesh 网络，请求蓝牙权限 |
-| 扫描未配网设备 | ✅ | ✅ | 广播 Mesh Provisioning Service (0x1827) |
-| PB-GATT 配网 | ✅ | ✅ | 完整 Provisioning + 自动 AppKey 分发与模型绑定 |
-| Proxy 连接 | ✅ | ✅ | 连接 Mesh Proxy Service (0x1828) 收发加密 PDU |
-| 单播控制 | ✅ | ✅ | Generic On/Off、Generic Level |
-| 分组管理 | ✅ | ✅ | 创建/删除 Group，Subscription Add / Delete |
-| 组播控制 | ✅ | ✅ | 向分组地址发送 Generic On/Off |
-| 换组 | ✅ | ✅ | `changeNodeGroup`：取消旧组订阅并加入新组 |
-| 同步组（Sync Group） | ✅ | ✅ | Vendor **0x0002** Publish/Subscribe，`configureSyncMaster/Slave` |
-| 节点删除 | ✅ | ✅ | Config Node Reset + 本地网络同步 |
-| 网络导入/导出 | ✅ | ✅ | nRF Mesh App 兼容 JSON |
-| Vendor 消息 | ✅ | ✅ | Espressif CID 0x02E5 主从切换、播放模式等 |
-| 场景管理 | ⚠️ 原生层 | ⚠️ 占位 | **尚未暴露 Dart 公开 API** |
-| Light Lightness | ⚠️ 原生层 | ⚠️ 原生层 | **尚未暴露 Dart 公开 API** |
+| Initialization & permissions | ✅ | ✅ | Load/create Mesh network, request Bluetooth permissions |
+| Scan unprovisioned devices | ✅ | ✅ | Advertises Mesh Provisioning Service (0x1827) |
+| PB-GATT provisioning | ✅ | ✅ | Full provisioning + automatic AppKey distribution and model binding |
+| Proxy connection | ✅ | ✅ | Connect to Mesh Proxy Service (0x1828) to send/receive encrypted PDUs |
+| Unicast control | ✅ | ✅ | Generic On/Off, Generic Level |
+| Group management | ✅ | ✅ | Create/delete groups, Subscription Add / Delete |
+| Multicast control | ✅ | ✅ | Send Generic On/Off to group addresses |
+| Change group | ✅ | ✅ | `changeNodeGroup`: remove old group subscription and join a new group |
+| Sync Group | ✅ | ✅ | Vendor **0x0001** / **0x0002**, `configureSyncModels` / `configureSyncMaster/Slave` |
+| Node deletion | ✅ | ✅ | Config Node Reset + local network sync |
+| Network import/export | ✅ | ✅ | nRF Mesh App compatible JSON |
+| Vendor messages | ✅ | ✅ | Espressif CID 0x02E5 master/slave switching, play mode, etc. |
+| Scene management | ⚠️ Native layer | ⚠️ Local placeholder | **Not yet exposed in Dart**; Android native can send Scene messages, iOS uses local cache placeholder |
+| Light Lightness | ⚠️ Native layer | ⚠️ Native layer | **Not yet exposed as a public Dart API** |
 
-## 架构
+## Architecture
 
 ```
 Flutter (Dart)
@@ -30,32 +30,32 @@ Flutter (Dart)
     └─ iOS     ── nRFMeshProvision ~4.2.0 (Swift)
 ```
 
-| 阶段 | 流程 |
+| Phase | Flow |
 |------|------|
-| **配网** | PB-GATT (0x1827) → 密钥交换 → 写入 Nordic Mesh DB |
-| **自动配置** | Proxy 就绪后 → `ConfigCompositionDataGet` → `ConfigAppKeyAdd` → `ConfigModelAppBind` |
-| **控制** | Proxy GATT (0x1828) → Nordic 加密栈 → 单播/组播 Mesh 消息 |
-| **分组** | 创建 Group → `ConfigModelSubscriptionAdd` / `Delete` → 向组地址发控制消息 |
+| **Provisioning** | PB-GATT (0x1827) → key exchange → write to Nordic Mesh DB |
+| **Auto-configuration** | After Proxy is ready → `ConfigCompositionDataGet` → `ConfigAppKeyAdd` → `ConfigModelAppBind` |
+| **Control** | Proxy GATT (0x1828) → Nordic encryption stack → unicast/multicast Mesh messages |
+| **Grouping** | Create group → `ConfigModelSubscriptionAdd` / `Delete` → send control messages to group address |
 
-配网完成后，**原生层会自动连接 Proxy 并下发 AppKey / 模型绑定**（约 2.5s 延迟等待设备切换广播）。Dart 层监听 `configurationState` 等待 `complete` 即可，**不要在每次 Proxy 连接时重复调用 `distributeAppKey()`**。
+After provisioning completes, the **native layer automatically connects to Proxy and distributes AppKey / model bindings** (with ~2.5s delay waiting for the device to switch advertising). The Dart layer should listen to `configurationState` and wait for `complete` — **do not call `distributeAppKey()` on every Proxy connection**.
 
-## 安装
+## Installation
 
-在 `pubspec.yaml` 中添加：
+Add to `pubspec.yaml`:
 
 ```yaml
 dependencies:
   ble_mesh:
-    path: ../ble_mesh   # 或发布后的版本号
+    path: ../ble_mesh   # or published version number
 ```
 
-运行 `flutter pub get` 后，iOS 会通过 `ble_mesh.podspec` 自动引入 `nRFMeshProvision`，Android 通过 `build.gradle.kts` 引入 Nordic Mesh 库，**无需手动改 Podfile**。
+After running `flutter pub get`, iOS automatically pulls in `nRFMeshProvision` via `ble_mesh.podspec`, and Android pulls in the Nordic Mesh library via `build.gradle.kts`. **No manual Podfile changes required**.
 
-## 快速开始
+## Quick Start
 
-### 1. 初始化
+### 1. Initialization
 
-推荐使用 `initializeAndWaitForNetwork`，确保本地 Mesh DB 加载完成后再扫描/配网：
+Use `initializeAndWaitForNetwork` to ensure the local Mesh DB is loaded before scanning/provisioning:
 
 ```dart
 final mesh = BleMesh();
@@ -64,58 +64,59 @@ await mesh.initializeAndWaitForNetwork(
   timeout: const Duration(seconds: 10),
 );
 
-// Android 必须请求蓝牙权限
+// Android must request Bluetooth permissions; iOS returns true directly,
+// permissions are prompted by the system on first Bluetooth use
 final granted = await mesh.requestPermissions();
 if (!granted) {
-  // 处理权限拒绝
+  // Handle permission denial (mainly on Android)
 }
 ```
 
-### 2. 监听事件
+### 2. Listen to Events
 
 ```dart
-// 蓝牙开关
+// Bluetooth on/off state
 mesh.bluetoothState.listen((state) { /* ... */ });
 
-// 扫描结果
+// Scan results
 mesh.scanResults.listen((device) {
   print('${device.name} uuid=${device.uuid} rssi=${device.rssi}');
 });
 
-// 配网进度
+// Provisioning progress
 mesh.provisioningState.listen((state) { /* connecting / provisioning / complete / failed */ });
 
-// 新节点加入
+// New node added
 mesh.nodeAdded.listen((node) {
-  print('节点 ${node.name} 地址 ${node.hexAddress}');
+  print('Node ${node.name} address ${node.hexAddress}');
 });
 
-// 配网后配置进度（AppKey + 模型绑定）—— 控制前必须等到 complete
+// Post-provisioning configuration progress (AppKey + model binding) — wait for complete before control
 mesh.configurationState.listen((status) {
   switch (status.state) {
     case MeshConfigurationState.pendingProxy:
-      print('等待 Proxy 连接…');
+      print('Waiting for Proxy connection…');
     case MeshConfigurationState.proxyConnected:
-      print('开始下发 AppKey / Bind…');
+      print('Starting AppKey / Bind distribution…');
     case MeshConfigurationState.complete:
-      print('节点 ${status.unicastAddress} 配置完成，可以控制');
+      print('Node ${status.unicastAddress} configured, ready for control');
     case MeshConfigurationState.failed:
-      print('配置失败: ${status.message}');
+      print('Configuration failed: ${status.message}');
     default:
       break;
   }
 });
 
-// Proxy 连接状态
+// Proxy connection state
 mesh.connectionState.listen((state) { /* connected / disconnected */ });
 
-// 节点删除完成
+// Node deletion complete
 mesh.nodeDeleted.listen((unicastAddress) {
-  print('节点已删除: 0x${unicastAddress.toRadixString(16)}');
+  print('Node deleted: 0x${unicastAddress.toRadixString(16)}');
 });
 ```
 
-### 3. 扫描与配网
+### 3. Scan and Provision
 
 ```dart
 await mesh.startScan(timeout: const Duration(seconds: 15));
@@ -123,28 +124,28 @@ await mesh.startScan(timeout: const Duration(seconds: 15));
 try {
   await mesh.provisionDevice(
     uuid: device.uuid,
-    address: device.address,   // Android: MAC；iOS: CBPeripheral UUID
-    nodeName: '客厅灯',
+    address: device.address,   // Android: MAC; iOS: CBPeripheral UUID
+    nodeName: 'Living Room Light',
   );
 } on ProvisioningException catch (e) {
-  print('配网失败: ${e.message}');
+  print('Provisioning failed: ${e.message}');
 }
 ```
 
-> **说明**：`provisionDevice` 的 `address` 是扫描结果中的 **蓝牙标识**（`BleMeshDevice.address`），不是 Mesh 单播地址。单播地址由 Nordic 库根据 Provisioner 范围自动分配（跳过 exclusion list 中已删除地址）。
+> **Note**: The `address` parameter in `provisionDevice` is the **Bluetooth identifier** from scan results (`BleMeshDevice.address`), not the Mesh unicast address. The unicast address is automatically assigned by the Nordic library based on the Provisioner range (skipping addresses in the exclusion list from deleted nodes).
 
-### 4. 配网后自动配置（AppKey + 模型绑定）
+### 4. Post-Provisioning Auto-Configuration (AppKey + Model Binding)
 
-配网成功后原生层会：
+After successful provisioning, the native layer will:
 
-1. 将节点加入待配置队列
-2. 约 2.5s 后自动连接 Proxy
-3. Proxy 就绪后发送 Composition → AppKey Add → Model Bind
+1. Add the node to the pending configuration queue
+2. Automatically connect to Proxy after ~2.5s
+3. After Proxy is ready, send Composition → AppKey Add → Model Bind
 
-Dart 层只需监听 `configurationState`：
+The Dart layer only needs to listen to `configurationState`:
 
 ```dart
-// ✅ 推荐：等待原生自动配置完成
+// ✅ Recommended: wait for native auto-configuration to complete
 await mesh.configurationState
     .firstWhere(
       (s) =>
@@ -153,18 +154,18 @@ await mesh.configurationState
     )
     .timeout(const Duration(seconds: 30));
 
-// ⚠️ 仅手动重试时使用（例如配置失败后点「重新分发」）
+// ⚠️ Use only for manual retry (e.g. tap "Redistribute" after config failure)
 await mesh.distributeAppKey(nodeAddress);
 ```
 
-**注意**
+**Notes**
 
-- Proxy 重连（分组、换组等）**不会**对已配置节点重复下发 AppKey（双端均只对队列中节点或 `applicationKeys` 为空的节点配置）。
-- 不要在 `connectionState == connected` 回调里无条件调用 `distributeAppKey()`，否则可能与原生自动配置冲突。
+- Proxy reconnection (grouping, change group, etc.) **will not** re-distribute AppKey to already configured nodes (both platforms only configure nodes in the queue or nodes with empty `applicationKeys`).
+- Do not unconditionally call `distributeAppKey()` in a `connectionState == connected` callback, as it may conflict with native auto-configuration.
 
-### 5. 连接 Proxy
+### 5. Connect to Proxy
 
-控制消息需先连接节点的 **Mesh Proxy Service**。`connectToProxy` 参数是 **蓝牙地址**，通常使用 `node.macAddress`：
+Control messages require connecting to the node's **Mesh Proxy Service** first. The `connectToProxy` parameter is the **Bluetooth address**, typically `node.macAddress`:
 
 ```dart
 if (node.macAddress != null) {
@@ -172,33 +173,33 @@ if (node.macAddress != null) {
 }
 ```
 
-> **注意**：`macAddress` 仅在本次 App 运行期间缓存。冷启动后若为空，需重新扫描获取蓝牙标识。
+> **Note**: The native layer persists Mesh UUID → peripheral UUID mapping to `UserDefaults` (iOS) / in-memory cache (Android). After a cold start, `getNodes()` usually restores `macAddress`. If iOS cannot `retrievePeripherals` (device not discovered by this app for a long time), you need to scan again before connecting to Proxy.
 
-### 6. 单播控制
+### 6. Unicast Control
 
 ```dart
-// 需：Proxy 已连接 + configurationState.complete
+// Requires: Proxy connected + configurationState.complete
 await mesh.sendGenericOnOff(address: 0x0002, onOff: true);
 await mesh.sendGenericLevel(address: 0x0002, level: 16384);
 ```
 
-### 7. 分组控制
+### 7. Group Control
 
-默认控制分组地址 `kDefaultControlGroupAddress`（`0xC001`）：
+Default control group address is `kDefaultControlGroupAddress` (`0xC001`):
 
 ```dart
 import 'package:ble_mesh/ble_mesh.dart';
 
-// 1. 确保分组存在
+// 1. Ensure the group exists
 final group = await mesh.ensureGroup(
-  name: '控制组',
+  name: 'Control Group',
   address: kDefaultControlGroupAddress,
 );
 
-// 2. 连接 Proxy
+// 2. Connect to Proxy
 await mesh.connectToProxy(node.macAddress!);
 
-// 3. 订阅分组（配网后已 Bind AppKey，此处只发 Subscription Add）
+// 3. Subscribe to group (AppKey already bound after provisioning; only Subscription Add here)
 for (final addr in [0x0002, 0x0003]) {
   await mesh.addModelSubscription(
     nodeAddress: addr,
@@ -207,32 +208,32 @@ for (final addr in [0x0002, 0x0003]) {
   );
 }
 
-// 4. 组播控制
+// 4. Multicast control
 await mesh.sendGenericOnOff(
   address: kDefaultControlGroupAddress,
   onOff: false,
 );
 ```
 
-#### 换组 / 取消订阅
+#### Change Group / Remove Subscription
 
 ```dart
-// 将设备从 0xC001 换到 0xC002（Delete → Add，目标组不存在时自动创建）
+// Move device from 0xC001 to 0xC002 (Delete → Add, auto-creates target group if missing)
 await mesh.changeNodeGroup(
   nodeAddress: 0x0002,
   fromGroupAddress: kDefaultControlGroupAddress,
   toGroupAddress: 0xC002,
-  targetGroupName: '备用组',
+  targetGroupName: 'Backup Group',
 );
 
-// 批量换组
+// Batch change group
 await mesh.changeNodesGroup(
   nodeAddresses: [0x0002, 0x0003],
   fromGroupAddress: 0xC001,
   toGroupAddress: 0xC002,
 );
 
-// 仅从当前组移除
+// Remove from current group only
 await mesh.removeModelSubscription(
   nodeAddress: 0x0002,
   modelId: kGenericOnOffModelId,
@@ -240,40 +241,40 @@ await mesh.removeModelSubscription(
 );
 ```
 
-#### 模型订阅 / 发布（可单选或组合）
+#### Model Subscription / Publication (single or combined)
 
-使用 [MeshModelMessagingMode] 明确选择能力，或分别调用底层 API：
+Use [MeshModelMessagingMode] to explicitly select capabilities, or call lower-level APIs separately:
 
 ```dart
-// 组合配置（推荐）：Bind + 订阅/发布
+// Combined configuration (recommended): Bind + subscribe/publish
 await mesh.configureModel(
   nodeAddress: 0x0002,
   modelId: kGenericOnOffModelId,
   groupAddress: kDefaultControlGroupAddress,
-  mode: MeshModelMessagingMode.subscribeOnly, // 仅订阅
+  mode: MeshModelMessagingMode.subscribeOnly, // subscribe only
 );
 
 await mesh.configureModel(
   nodeAddress: 0x0002,
   modelId: kDeviceControlModelCompoundId,
-  mode: MeshModelMessagingMode.appKeyOnly, // 仅 Bind AppKey，无需 groupAddress
+  mode: MeshModelMessagingMode.appKeyOnly, // Bind AppKey only, no groupAddress needed
 );
 
 await mesh.configureModel(
   nodeAddress: 0x0002,
   modelId: kDeviceControlModelCompoundId,
   groupAddress: kDefaultSyncGroupAddress,
-  mode: MeshModelMessagingMode.publishOnly, // 仅发布
+  mode: MeshModelMessagingMode.publishOnly, // publish only
 );
 
 await mesh.configureModel(
   nodeAddress: 0x0002,
   modelId: kSyncModelCompoundId,
   groupAddress: kDefaultSyncGroupAddress,
-  mode: MeshModelMessagingMode.subscribeAndPublish, // 订阅 + 发布
+  mode: MeshModelMessagingMode.subscribeAndPublish, // subscribe + publish
 );
 
-// 原子操作（配网后已 Bind AppKey 时无需再 bind）
+// Atomic operations (no bind needed if AppKey already bound after provisioning)
 await mesh.addModelSubscription(
   nodeAddress: 0x0002,
   modelId: kGenericOnOffModelId,
@@ -295,74 +296,74 @@ await mesh.removeModelSubscription(
 await mesh.setModelPublication(
   nodeAddress: 0x0002,
   modelId: kDeviceControlModelCompoundId,
-  publishAddress: 0, // 清除发布
+  publishAddress: 0, // clear publication
 );
 ```
 
-**Example 应用** 主页 AppBar「分组控制测试」页包含：创建分组 → 订阅 → 换组 → 组播；节点控制页含 Sync Group 主从配置 UI。
+The **Example app** home page AppBar "Group Control Test" page includes: create group → subscribe → change group → multicast; the node control page includes Sync Group master/slave configuration UI.
 
-### 8. 同步组（Sync Group）
+### 8. Sync Group
 
-同步组（默认 `0xC000`）用于固件 `send_ble_mesh_sync_mode`。通过 [configureSyncModels] 对 Vendor **0x0001** / **0x0002** 灵活配置：
+The sync group (default `0xC000`) is used for firmware `send_ble_mesh_sync_mode`. Configure Vendor **0x0001** / **0x0002** flexibly via [configureSyncModels]:
 
-| 选项 | 说明 |
+| Option | Description |
 |------|------|
-| **模型** | 可只选 0x0001、只选 0x0002，或两者（`modelIds`） |
-| **能力** | `appKeyOnly` / `subscribeOnly` / `publishOnly` / `subscribeAndPublish` |
+| **Models** | Select only 0x0001, only 0x0002, or both (`modelIds`) |
+| **Capabilities** | `appKeyOnly` / `subscribeOnly` / `publishOnly` / `subscribeAndPublish` |
 
 ```dart
 await mesh.connectToProxy(node.macAddress!);
 
-// 灵活配置：两个模型 + 订阅+发布
+// Flexible configuration: both models + subscribe + publish
 await mesh.configureSyncModels(
   nodeAddress: 0x0002,
   mode: MeshModelMessagingMode.subscribeAndPublish,
 );
 
-// 仅 0x0002 发布
+// 0x0002 publish only
 await mesh.configureSyncModels(
   nodeAddress: 0x0002,
   mode: MeshModelMessagingMode.publishOnly,
   modelIds: [kDeviceControlModelCompoundId],
 );
 
-// 仅 Bind AppKey，不配置订阅/发布
+// Bind AppKey only, no subscription/publication
 await mesh.configureSyncModels(
   nodeAddress: 0x0002,
   mode: MeshModelMessagingMode.appKeyOnly,
   modelIds: kSyncVendorModelCompoundIds,
 );
 
-// 快捷：主机 / 从机（仍支持 modelIds 参数）
+// Shortcuts: master / slave (modelIds parameter still supported)
 await mesh.configureSyncMaster(nodeAddress: 0x0002);
 await mesh.configureSyncSlave(nodeAddress: 0x0003);
 ```
 
-### 9. 删除节点与重配网
+### 9. Delete Node and Re-Provision
 
 ```dart
 await mesh.deleteNode(0x0002);
-// 等待 nodeDeleted 后再重配网
+// Wait for nodeDeleted before re-provisioning
 ```
 
-| 注意项 | 说明 |
+| Note | Description |
 |--------|------|
-| 等待删除完成 | 删除会发 `Config Node Reset` 并断开 GATT，应监听 `nodeDeleted` |
-| 地址自动分配 | 重配网不要手动指定单播地址；Nordic 使用 `nextAvailableUnicastAddress` |
-| iOS GATT 清理 | 删除/重配网前会关闭 PB-GATT Bearer，避免「设备已被使用」 |
-| 设备端 Reset | 设备已 Reset 但 App 仍有旧节点时，先 `deleteNode` 或导入干净网络 |
+| Wait for deletion to complete | Deletion sends `Config Node Reset` and disconnects GATT; listen for `nodeDeleted` |
+| Automatic address assignment | Do not manually specify unicast address on re-provision; Nordic uses `nextAvailableUnicastAddress` |
+| iOS GATT cleanup | PB-GATT Bearer is closed before delete/re-provision to avoid "device already in use" |
+| Device-side reset | If device has reset but app still has old node, call `deleteNode` first or import a clean network |
 
-### 10. 网络备份与迁移
+### 10. Network Backup and Migration
 
 ```dart
 final json = await mesh.exportNetworkJson();
 await mesh.importNetworkJson(json);
-// 触发 networkLoaded / networkUpdated
+// Triggers networkLoaded / networkUpdated
 ```
 
-格式与 nRF Mesh App 的 Mesh Configuration Database 兼容。
+Format is compatible with the nRF Mesh App Mesh Configuration Database.
 
-### 11. Vendor 设备控制（Espressif）
+### 11. Vendor Device Control (Espressif)
 
 ```dart
 await mesh.setMasterSlaveRole(address: 0x0002, role: MeshNodeRole.master);
@@ -382,111 +383,114 @@ mesh.vendorMessages.listen((status) {
 });
 ```
 
-| 常量 | 值 | 用途 |
+| Constant | Value | Purpose |
 |------|-----|------|
 | `kVendorCompanyId` | `0x02E5` | Espressif CID |
-| `kDefaultSyncGroupAddress` | `0xC000` | 同步组播地址 |
-| `kDefaultControlGroupAddress` | `0xC001` | 默认控制分组 |
+| `kDefaultSyncGroupAddress` | `0xC000` | Sync multicast address |
+| `kDefaultControlGroupAddress` | `0xC001` | Default control group |
 | `kGenericOnOffModelId` | `0x1000` | SIG Generic OnOff Server |
 
-## 完整工作流
+## Complete Workflow
 
 ```
 initializeAndWaitForNetwork
         ↓
    startScan → provisionDevice
         ↓
-  原生自动连 Proxy（~2.5s）
+  Native auto-connects Proxy (~2.5s)
         ↓
- configurationState.complete（AppKey + Model Bind）
+ configurationState.complete (AppKey + Model Bind)
         ↓
- connectToProxy（若未保持连接）
+ connectToProxy (if not already connected)
         ↓
- 单播控制 / ensureGroup → addModelSubscription → 组播
+ Unicast control / ensureGroup → addModelSubscription → multicast
         ↓
- changeNodeGroup（可选：换到其他组）
+ changeNodeGroup (optional: move to another group)
 ```
 
-## 错误处理
+## Error Handling
 
-所有异常继承自 `BleMeshException`：
+All exceptions inherit from `BleMeshException`:
 
 ```dart
 try {
   await mesh.sendGenericOnOff(address: 0x0002, onOff: true);
 } on NotInitializedException {
-  // 未调用 initialize()
+  // initialize() not called
 } on NotConnectedException {
-  // 未连接 Proxy
+  // Proxy not connected
 } on BluetoothDisabledException {
-  // 蓝牙已关闭
+  // Bluetooth is off
 } on PermissionDeniedException {
-  // 权限被拒绝
+  // Permission denied
 } on ProvisioningException catch (e) {
-  // 配网失败
+  // Provisioning failed
 } on BleMeshException catch (e) {
   print('[${e.code}] ${e.message}');
 }
 ```
 
-## 调试
+## Debugging
 
-### Xcode（iOS）
+### Xcode (iOS)
 
-Console 过滤 `BleMesh` 或以下标签：
+Filter Console by `BleMesh` or the following tags:
 
-| 标签 | 含义 |
+| Tag | Meaning |
 |------|------|
-| `[PROVISION]` | 配网与地址分配 |
-| `[DELETE]` | 节点删除与 Reset |
+| `[PROVISION]` | Provisioning and address assignment |
+| `[DELETE]` | Node deletion and reset |
 | `[GROUP]` | AppKey / Bind / Subscription Add·Delete |
-| `[PROXY]` | Proxy 连接与 PDU |
-| `[NET]` / `[CACHE]` | 网络 DB 与缓存 |
+| `[PROXY]` | Proxy connection and PDU |
+| `[NET]` / `[CACHE]` | Network DB and cache |
 
-**AppKey 配置成功** 应看到：
-
-```
-─── 开始向节点 0x0002 分发 AppKey ───
-Composition Data 获取成功，待绑定模型数=3
-发送 ConfigAppKeyAdd → 0x0002
-绑定 SIG Model 0x1000 @0x0002
-─── AppKey 分发序列完成 ───
-```
-
-**分组订阅成功** 应看到：
+**Successful AppKey configuration** should show:
 
 ```
-[GROUP] 发送 ConfigModelSubscriptionAdd ... group=0xC001
-[GROUP] ConfigModelSubscriptionAdd 成功
+─── Starting AppKey distribution to node 0x0002 ───
+Composition Data retrieved, models to bind=4
+Sending ConfigAppKeyAdd → 0x0002
+Binding SIG Model 0x1000 @0x0002
+Binding SIG Model 0x1002 @0x0002
+Binding Vendor Model CID=0x02E5 Model=0x0001 @0x0002
+Binding Vendor Model CID=0x02E5 Model=0x0002 @0x0002
+─── AppKey distribution sequence complete ───
 ```
 
-**换组成功** 应看到：
+**Successful group subscription** should show:
 
 ```
-[GROUP] 发送 ConfigModelSubscriptionDelete ... group=0xC001
-[GROUP] ConfigModelSubscriptionDelete 成功
-[GROUP] 发送 ConfigModelSubscriptionAdd ... group=0xC002
+[GROUP] Sending ConfigModelSubscriptionAdd ... group=0xC001
+[GROUP] ConfigModelSubscriptionAdd succeeded
 ```
 
-设备串口（ESP 等）对应：`MODEL_OP_APPKEY_ADD`、`MODEL_OP_MODEL_APP_BIND`、`MODEL_OP_MODEL_SUB_ADD` / `MODEL_OP_MODEL_SUB_DELETE`，组控时 `dst 0xc001`。
+**Successful group change** should show:
+
+```
+[GROUP] Sending ConfigModelSubscriptionDelete ... group=0xC001
+[GROUP] ConfigModelSubscriptionDelete succeeded
+[GROUP] Sending ConfigModelSubscriptionAdd ... group=0xC002
+```
+
+Device serial output (ESP, etc.) corresponds to: `MODEL_OP_APPKEY_ADD`, `MODEL_OP_MODEL_APP_BIND`, `MODEL_OP_MODEL_SUB_ADD` / `MODEL_OP_MODEL_SUB_DELETE`; for group control, `dst 0xc001`.
 
 ### Android
 
-Logcat 过滤 `BleMesh` 或 `BleMeshNetworkManager`。
+Filter Logcat by `BleMesh` or `BleMeshNetworkManager`.
 
-### Example 应用
+### Example App
 
 ```bash
 cd example && flutter run
 ```
 
-主页含设备列表、单播/Vendor 控制、调试日志面板；AppBar 分组图标进入分组/换组测试页。
+The home page includes device list, unicast/Vendor control, and a debug log panel; the AppBar group icon opens the group/change-group test page.
 
-## 平台配置
+## Platform Configuration
 
 ### Android
 
-`AndroidManifest.xml` 需包含（插件通常已合并）：
+`AndroidManifest.xml` must include (usually merged by the plugin):
 
 ```xml
 <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
@@ -494,84 +498,88 @@ cd example && flutter run
 <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 ```
 
-依赖：`no.nordicsemi.android:mesh:3.3.7`（见 `android/build.gradle.kts`）。
+Dependency: `no.nordicsemi.android:mesh:3.3.7` (see `android/build.gradle.kts`).
 
 ### iOS
 
-`Info.plist` 添加蓝牙用途说明：
+Add Bluetooth usage descriptions to `Info.plist`:
 
 ```xml
 <key>NSBluetoothAlwaysUsageDescription</key>
-<string>需要蓝牙权限以控制 Mesh 灯光设备</string>
+<string>Bluetooth permission is required to control Mesh lighting devices</string>
 <key>NSBluetoothPeripheralUsageDescription</key>
-<string>需要蓝牙权限以控制 Mesh 灯光设备</string>
+<string>Bluetooth permission is required to control Mesh lighting devices</string>
 ```
 
-依赖：`nRFMeshProvision ~> 4.2.0`（见 `ios/ble_mesh.podspec`）。
+Dependency: `nRFMeshProvision ~> 4.2.0` (see `ios/ble_mesh.podspec`).
 
-最低系统版本：**iOS 13.0**。
+Minimum system version: **iOS 13.0**.
 
-## Dart API 参考
+## Dart API Reference
 
-### 主要方法
+### Main Methods
 
-| 方法 | 说明 |
+| Method | Description |
 |------|------|
-| `initialize()` / `initializeAndWaitForNetwork()` | 初始化并加载 Mesh 网络 |
-| `startScan()` / `stopScan()` | 扫描未配网设备 |
-| `provisionDevice()` / `cancelProvisioning()` | 配网 |
-| `connectToProxy()` / `disconnectFromProxy()` | Proxy 连接（蓝牙地址字符串） |
-| `distributeAppKey()` | 手动触发 AppKey 配置（失败重试用） |
-| `sendGenericOnOff()` / `sendGenericLevel()` | SIG 模型控制 |
-| `getNodes()` / `deleteNode()` | 节点管理 |
-| `createGroup()` / `deleteGroup()` / `ensureGroup()` | 分组管理 |
+| `initialize()` / `initializeAndWaitForNetwork()` | Initialize and load Mesh network |
+| `startScan()` / `stopScan()` | Scan for unprovisioned devices |
+| `provisionDevice()` / `cancelProvisioning()` | Provisioning |
+| `connectToProxy()` / `disconnectFromProxy()` | Proxy connection (Bluetooth address string) |
+| `distributeAppKey()` | Manually trigger AppKey configuration (for retry on failure) |
+| `sendGenericOnOff()` / `sendGenericLevel()` | SIG model control |
+| `getNodes()` / `deleteNode()` | Node management |
+| `createGroup()` / `deleteGroup()` / `ensureGroup()` | Group management |
 | `addModelSubscription()` / `removeModelSubscription()` | Subscription Add / Delete |
-| `setModelPublication()` | Publication Set（`publishAddress: 0` 清除发布） |
-| `configureModel()` | Bind + 按 `MeshModelMessagingMode` 配置订阅/发布 |
-| `changeNodeGroup()` / `changeNodesGroup()` | 换组（Delete + Add，仅订阅） |
-| `configureSyncModels()` | Vendor 0x0001/0x0002 灵活配置（模型 + 订阅/发布/AppKey） |
-| `configureSyncMaster()` / `configureSyncSlave()` | Sync 主从快捷配置 |
-| `exportNetworkJson()` / `importNetworkJson()` | 网络备份 |
-| `sendVendorMessage()` / `setMasterSlaveRole()` / `setPlayMode()` | Vendor 控制 |
+| `setModelPublication()` | Publication Set (`publishAddress: 0` clears publication) |
+| `configureModel()` | Bind + configure subscription/publication per `MeshModelMessagingMode` |
+| `changeNodeGroup()` / `changeNodesGroup()` | Change group (Delete + Add, subscription only) |
+| `configureSyncModels()` | Flexible Vendor 0x0001/0x0002 configuration (models + subscribe/publish/AppKey) |
+| `configureSyncMaster()` / `configureSyncSlave()` | Sync master/slave shortcut configuration |
+| `configureDefaultSyncSlave()` / `promoteSyncModelToMaster()` / `demoteSyncModelToSlave()` | Sync role switching helpers |
+| `getNodeByAddress()` / `getNodeByUuid()` / `getGroupByAddress()` | Node and group queries |
+| `exportNetworkJson()` / `importNetworkJson()` | Network backup |
+| `sendVendorMessage()` / `setMasterSlaveRole()` / `setPlayMode()` | Vendor control |
 
-### 主要事件流
+### Main Event Streams
 
-| 流 | 说明 |
+| Stream | Description |
 |----|------|
-| `scanResults` | 扫描到的未配网设备 |
-| `provisioningState` | 配网状态 |
-| `nodeAdded` | 新节点加入 |
-| `configurationState` | 配网后 AppKey / Bind 进度（**控制前必听**） |
-| `connectionState` | Proxy 连接状态 |
-| `nodeDeleted` | 节点删除完成 |
-| `networkLoaded` / `networkUpdated` | 网络加载/变更 |
-| `meshMessages` / `vendorMessages` | 收到的状态消息 |
+| `scanResults` | Unprovisioned devices found during scan |
+| `provisioningState` | Provisioning state |
+| `nodeAdded` | New node added |
+| `configurationState` | Post-provisioning AppKey / Bind progress (**must listen before control**) |
+| `connectionState` | Proxy connection state |
+| `nodeDeleted` | Node deletion complete |
+| `networkLoaded` / `networkUpdated` | Network loaded/changed |
+| `meshMessages` / `vendorMessages` | Received status messages |
 
-### configurationState 状态
+### configurationState States
 
-| 状态 | 含义 |
+Common states are listed below; see the full `MeshConfigurationState` enum for granular states such as `compositionGetting`, `appKeyAdding`, `modelBinding`, etc.
+
+| State | Meaning |
 |------|------|
-| `pendingProxy` | 配网完成，等待 Proxy |
-| `proxyConnected` | Proxy 已连，正在下发配置消息 |
-| `complete` | AppKey + 模型绑定完成 |
-| `failed` | 配置失败（见 `message`） |
+| `pendingProxy` | Provisioning complete, waiting for Proxy |
+| `proxyConnected` | Proxy connected, sending configuration messages |
+| `complete` | AppKey + model binding complete |
+| `failed` | Configuration failed (see `message`) |
 
-## 数据模型
+## Data Models
 
-| 类型 | 说明 |
+| Type | Description |
 |------|------|
-| `BleMeshDevice` | 扫描到的未配网设备 |
-| `MeshNode` | 已配网节点（含 `unicastAddress`、`macAddress`、元素列表） |
-| `MeshElement` | 节点元素 |
-| `MeshGroup` | 分组（组播地址） |
-| `MeshNetworkInfo` | 网络摘要（NetKey、AppKey、IV Index 等） |
-| `MeshConfigurationStatus` | 配置阶段状态 |
-| `MeshMessageStatus` | SIG 模型状态回包 |
-| `VendorMessageStatus` | Vendor 模型状态回包 |
+| `BleMeshDevice` | Unprovisioned device from scan |
+| `MeshNode` | Provisioned node (includes `unicastAddress`, `macAddress`, element list) |
+| `MeshElement` | Node element |
+| `MeshGroup` | Group (multicast address) |
+| `MeshNetworkInfo` | Network summary (NetKey, AppKey, IV Index, etc.) |
+| `MeshConfigurationStatus` | Configuration phase status |
+| `MeshMessageStatus` | SIG model status response |
+| `VendorMessageStatus` | Vendor model status response |
 
-## 常用 Mesh 模型 ID
+## Common Mesh Model IDs
 
-| 模型 | ID |
+| Model | ID |
 |------|-----|
 | Generic On/Off Server | `0x1000` |
 | Generic On/Off Client | `0x1001` |
@@ -580,22 +588,22 @@ cd example && flutter run
 | Light Lightness Server | `0x1300` |
 | Scene Server | `0x1203` |
 
-## 常用 Mesh 地址范围
+## Common Mesh Address Ranges
 
-| 范围 | 用途 |
+| Range | Purpose |
 |------|------|
-| `0x0001 – 0x7FFF` | 单播地址（Provisioner 通常占 `0x0001`） |
-| `0xC000 – 0xFEFF` | 分组地址 |
-| `0xFF00 – 0xFFFF` | 固定组地址（如 `0xFFFF` 全节点） |
+| `0x0001 – 0x7FFF` | Unicast addresses (Provisioner typically uses `0x0001`) |
+| `0xC000 – 0xFEFF` | Group addresses |
+| `0xFF00 – 0xFFFF` | Fixed group addresses (e.g. `0xFFFF` for all nodes) |
 
-## 已知限制
+## Known Limitations
 
-- **场景 API**：原生层有占位实现，Dart 层尚未公开 `getScenes` / `storeScene` 等方法。
-- **Light Lightness**：原生已实现，Dart 层尚未公开 `sendLightLightness`。
-- **`macAddress` 非持久化**：App 重启后需重新扫描获取蓝牙地址再连 Proxy。
-- **Publication / Proxy Filter**：Publication Set 已支持 iOS/Android；Proxy Filter 尚未实现。
-- **多 Proxy 节点**：同时只维护一条 Proxy GATT 连接，组播经当前 Proxy 转发。
+- **Scene API**: Dart layer does not yet expose `getScenes` / `storeScene` and similar methods; Android native can send Scene Mesh messages, iOS uses local cache placeholder.
+- **Light Lightness**: Implemented natively (iOS maps to Generic Level), but Dart layer does not yet expose `sendLightLightness`.
+- **`macAddress` recovery**: Usually restored from persisted mapping after cold start; if the system cannot retrieve the peripheral, re-scan is required.
+- **Manual Proxy Filter API**: Dart layer does not yet expose `setProxyFilterType` and similar interfaces; iOS internally uses Nordic Proxy Filter during auto-configuration.
+- **Multiple Proxy nodes**: Only one Proxy GATT connection is maintained at a time; multicast is forwarded through the current Proxy.
 
-## 许可证
+## License
 
 MIT License
