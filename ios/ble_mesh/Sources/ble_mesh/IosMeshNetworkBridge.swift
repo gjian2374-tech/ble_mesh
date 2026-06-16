@@ -57,10 +57,16 @@ final class IosMeshNetworkBridge: NSObject {
 
     func initialize() throws {
         MeshLog.d("initialize: 开始加载 Mesh 网络")
-        meshManager.localElements = []
         if try meshManager.load() {
+            // 必须在 load() 之后设置：Nordic 要求 meshNetwork / networkManager 就绪后
+            // 才能初始化 Configuration Server 等本地模型，否则 Proxy 配置消息无法发出。
+            meshManager.localElements = []
             try ensureDefaultAppKey()
+            restorePeripheralMappingsFromStorage()
+            restorePendingConfigurationQueue()
+            meshManager.proxyFilter.proxyDidDisconnect()
             MeshLog.d("initialize: 已加载现有网络")
+            logNetworkState("冷启动加载后")
             sendEvent(["type": "networkLoaded"])
             return
         }
@@ -946,8 +952,10 @@ final class IosMeshNetworkBridge: NSObject {
             }
             .map { node in
                 let key = node.uuid.meshHexString
+                let meshKey = normalizeKey(key)
                 let pid = peripheralIdByNodeKey[key]
-                    ?? peripheralIdByNodeKey[normalizeKey(key)]
+                    ?? peripheralIdByNodeKey[meshKey]
+                    ?? UserDefaults.standard.string(forKey: "ble_mesh_periph_\(meshKey)")
                 return buildNodeMap(node: node, peripheralId: pid)
             }
     }
@@ -1169,8 +1177,50 @@ final class IosMeshNetworkBridge: NSObject {
     }
 
     func registerPeripheralId(_ peripheralId: String, forMeshUuid hexUuid: String) {
-        peripheralIdByNodeKey[normalizeKey(hexUuid)] = peripheralId
+        let meshKey = normalizeKey(hexUuid)
+        peripheralIdByNodeKey[meshKey] = peripheralId
         peripheralIdByNodeKey[peripheralId.uppercased()] = peripheralId
+        UserDefaults.standard.set(peripheralId, forKey: "ble_mesh_periph_\(meshKey)")
+    }
+
+    /// 冷启动时从 UserDefaults 恢复 Mesh UUID → 外设 UUID 映射。
+    private func restorePeripheralMappingsFromStorage() {
+        guard let network = meshManager.meshNetwork else { return }
+        let provisionerUuid = network.localProvisioner?.uuid
+        var restored = 0
+        for node in network.nodes {
+            guard provisionerUuid == nil || node.uuid != provisionerUuid else { continue }
+            let meshKey = normalizeKey(node.uuid.meshHexString)
+            guard peripheralIdByNodeKey[meshKey] == nil,
+                  let saved = UserDefaults.standard.string(forKey: "ble_mesh_periph_\(meshKey)")
+            else { continue }
+            registerPeripheralId(saved, forMeshUuid: node.uuid.meshHexString)
+            restored += 1
+        }
+        if restored > 0 {
+            MeshLog.d("CACHE", "冷启动恢复外设映射 \(restored) 条")
+        }
+    }
+
+    /// 冷启动时恢复未完成 AppKey 配置的节点队列。
+    private func restorePendingConfigurationQueue() {
+        guard let network = meshManager.meshNetwork else { return }
+        let provisionerUuid = network.localProvisioner?.uuid
+        for node in network.nodes {
+            guard provisionerUuid == nil || node.uuid != provisionerUuid else { continue }
+            if node.applicationKeys.isEmpty {
+                pendingProxyInitializationAddresses.insert(node.primaryUnicastAddress)
+            }
+        }
+        if !pendingProxyInitializationAddresses.isEmpty {
+            MeshLog.d(
+                "initialize",
+                "恢复待配置节点 "
+                    + pendingProxyInitializationAddresses
+                    .map { String(format: "0x%04X", $0) }
+                    .joined(separator: ", ")
+            )
+        }
     }
 
     /// 打印当前 Mesh 网络状态（调试用）。

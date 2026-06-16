@@ -564,13 +564,14 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             do {
                 try bridge.initialize()
                 let info = bridge.getNetworkInfo()
-                if !info.isEmpty {
-                    DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    self.restoreMeshUuidMappingsFromBridge()
+                    if !info.isEmpty {
                         self.networkId = info["networkId"] as? String ?? self.networkId
                         self.networkName = info["name"] as? String ?? self.networkName
                     }
+                    result(nil)
                 }
-                DispatchQueue.main.async { result(nil) }
             } catch {
                 DispatchQueue.main.async {
                     result(FlutterError(
@@ -1062,6 +1063,29 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             }
         }
         return nil
+    }
+
+    /// 冷启动后把 Bridge 已恢复的节点 macAddress 同步到 Plugin 扫描缓存。
+    private func restoreMeshUuidMappingsFromBridge() {
+        guard let bridge = meshBridge else { return }
+        var restored = 0
+        for node in bridge.getNodes() {
+            let uuid = (node["uuid"] as? String) ?? ""
+            let mac = (node["macAddress"] as? String) ?? ""
+            guard !uuid.isEmpty, !mac.isEmpty else { continue }
+            let meshKey = normalizeUuidKey(uuid)
+            meshUuidToPeripheralId[meshKey] = mac.uppercased()
+            if let cbUuid = UUID(uuidString: mac),
+               let peripheral = centralManager?
+                .retrievePeripherals(withIdentifiers: [cbUuid])
+                .first {
+                cachePeripheral(peripheral, meshUUID: uuid)
+            }
+            restored += 1
+        }
+        if restored > 0 {
+            MeshLog.d("CACHE", "冷启动同步 Plugin 外设映射 \(restored) 条")
+        }
     }
 
     private func cachePeripheral(_ peripheral: CBPeripheral, meshUUID: String?) {
