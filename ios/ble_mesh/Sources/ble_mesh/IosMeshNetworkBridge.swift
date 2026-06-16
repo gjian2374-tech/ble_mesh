@@ -26,6 +26,8 @@ final class IosMeshNetworkBridge: NSObject {
     // -- Proxy 传输层（SAR 重组） --
     private var sarBuffer = Data()
     private var sarType: UInt8 = 0
+    /// 当前 GATT 会话是否已收到 Secure Network Beacon（断连后须重新等待）。
+    private var proxyBeaconReceivedForCurrentSession = false
 
     // -- 配网后自动配置（对齐 Android autoDistributeAppKey） --
     private static let sigModelsToBind: [UInt16] = [0x1000, 0x1002]
@@ -78,6 +80,7 @@ final class IosMeshNetworkBridge: NSObject {
     ///
     /// BleMeshPlugin 本身实现 Nordic `Transmitter` 协议，通过 Data In 特征写数据。
     func notifyProxyConnected(transmitter: Transmitter) {
+        resetProxySessionState()
         meshManager.transmitter = transmitter
         MeshLog.d("Proxy 已连接，Transmitter 已注入 Nordic 加密栈")
     }
@@ -85,7 +88,16 @@ final class IosMeshNetworkBridge: NSObject {
     /// 当 Proxy GATT 断连时由 BleMeshPlugin 调用。
     func notifyProxyDisconnected() {
         meshManager.transmitter = nil
-        MeshLog.d("Proxy 已断开")
+        resetProxySessionState()
+        // 清除 proxyNetworkKey / proxy 地址 / filter，避免重连后沿用已删除节点的陈旧状态。
+        meshManager.proxyFilter.proxyDidDisconnect()
+        MeshLog.d("Proxy 已断开，已重置 Proxy Filter 会话状态")
+    }
+
+    private func resetProxySessionState() {
+        sarBuffer = Data()
+        sarType = 0
+        proxyBeaconReceivedForCurrentSession = false
     }
 
     /// 处理从 Data Out 特征收到的原始 GATT Proxy PDU（含 SAR 重组）。
@@ -95,6 +107,11 @@ final class IosMeshNetworkBridge: NSObject {
         let sar     = (header >> 6) & 0x03   // bits 7-6
         let typeRaw = header & 0x3F           // bits 5-0
         let payload = Data(raw.dropFirst())
+        MeshLog.d(
+            "PROXY",
+            "DataOut SAR=\(sar) type=\(typeRaw) len=\(raw.count) "
+                + "payload=\(payload.count)"
+        )
 
         switch sar {
         case 0x00:
@@ -115,6 +132,9 @@ final class IosMeshNetworkBridge: NSObject {
 
     private func deliverToStack(_ data: Data, type typeRaw: UInt8) {
         guard let pduType = PduType(rawValue: typeRaw) else { return }
+        if pduType == .meshBeacon {
+            proxyBeaconReceivedForCurrentSession = true
+        }
         meshManager.bearerDidDeliverData(data, ofType: pduType)
     }
 
@@ -236,8 +256,8 @@ final class IosMeshNetworkBridge: NSObject {
                    "node": buildNodeMap(node: node, peripheralId: peripheralId)])
         sendEvent(["type": "networkUpdated"])
         pendingProxyInitializationAddresses.insert(node.primaryUnicastAddress)
-        // ESP 需更长时间切换 GATT（1827→1828）；固件常无法发 Service Change，iOS 须扫描重连。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+        // 等待设备从 PB-GATT 切换到 Proxy 广播（对齐 Android 2.5s 延迟）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             self?.onProxyConnectRequested?(peripheralId)
         }
     }
@@ -281,14 +301,6 @@ final class IosMeshNetworkBridge: NSObject {
 
     // MARK: - 配网后自动配置（对齐 Android onProxyConnected / autoDistributeAppKey）
 
-    /// 将节点加入待配置队列（手动连 Proxy / App 重启后重连时补入队）。
-    func enqueuePendingConfiguration(unicastAddress: UInt16) {
-        pendingProxyInitializationAddresses.insert(unicastAddress)
-        MeshLog.d(
-            "enqueuePendingConfiguration: 0x\(String(format: "%04X", unicastAddress))"
-        )
-    }
-
     /// Proxy GATT 就绪后由 BleMeshPlugin 调用，执行完整配置序列。
     func onProxyConnected() {
         guard meshManager.transmitter != nil else {
@@ -300,24 +312,8 @@ final class IosMeshNetworkBridge: NSObject {
             return
         }
 
-        var nodes = resolvePendingDeviceNodes()
-        if nodes.isEmpty {
-            let configured = resolveAlreadyConfiguredDeviceNodes()
-            for node in configured {
-                let addr = node.primaryUnicastAddress
-                let uuid = node.uuid.meshHexString
-                MeshLog.d(
-                    "onProxyConnected: 节点 0x\(String(format: "%04X", addr)) 已配置，通知 complete"
-                )
-                sendEvent([
-                    "type": "configurationStateChanged",
-                    "unicastAddress": Int(addr),
-                    "uuid": uuid,
-                    "state": "complete",
-                    "message": "节点 AppKey 与模型绑定已就绪",
-                ])
-            }
-            if !configured.isEmpty { return }
+        let nodes = resolvePendingDeviceNodes()
+        guard !nodes.isEmpty else {
             MeshLog.d("onProxyConnected: 无待配置节点")
             return
         }
@@ -336,6 +332,26 @@ final class IosMeshNetworkBridge: NSObject {
                     )
                     self.onProxyConnected()
                 }
+            }
+
+            let targetAddresses = nodes.map(\.primaryUnicastAddress)
+            do {
+                try await self.prepareProxyBeforeConfiguration(
+                    targetAddresses: targetAddresses
+                )
+            } catch {
+                MeshLog.e("PROXY", "Proxy 就绪失败: \(error.localizedDescription)")
+                for node in nodes {
+                    let addr = node.primaryUnicastAddress
+                    self.sendEvent([
+                        "type": "configurationStateChanged",
+                        "unicastAddress": Int(addr),
+                        "uuid": node.uuid.meshHexString,
+                        "state": "failed",
+                        "message": error.localizedDescription,
+                    ])
+                }
+                return
             }
 
             for node in nodes {
@@ -398,13 +414,17 @@ final class IosMeshNetworkBridge: NSObject {
         guard let appKey = appKeyObject(at: 0) else {
             throw MeshBridgeError.networkNotReady
         }
+        guard let networkKey = primaryNetworkKey() else {
+            throw MeshBridgeError.networkNotReady
+        }
 
         MeshLog.d("─── 开始向节点 0x\(String(format: "%04X", unicastAddress)) 分发 AppKey ───")
         try await Task.sleep(nanoseconds: 400_000_000)
 
-        let response = try await meshManager.send(
+        let response = try await sendConfigWithTimeout(
             ConfigCompositionDataGet(),
-            to: unicastAddress
+            to: unicastAddress,
+            using: networkKey
         )
         guard let compositionStatus = response as? ConfigCompositionDataStatus,
               compositionStatus.page != nil else {
@@ -433,9 +453,10 @@ final class IosMeshNetworkBridge: NSObject {
 
         try await Task.sleep(nanoseconds: 300_000_000)
         MeshLog.d("发送 ConfigAppKeyAdd → 0x\(String(format: "%04X", unicastAddress))")
-        let appKeyStatus = try await meshManager.send(
+        let appKeyStatus = try await sendConfigWithTimeout(
             ConfigAppKeyAdd(applicationKey: appKey),
-            to: unicastAddress
+            to: unicastAddress,
+            using: networkKey
         )
         guard let status = appKeyStatus as? ConfigAppKeyStatus else {
             throw MeshBridgeError.configFailed("AppKey 添加失败：响应无效")
@@ -459,7 +480,11 @@ final class IosMeshNetworkBridge: NSObject {
                 modelIdentifier: target.modelIdentifier,
                 companyIdentifier: target.companyIdentifier
             )
-            let bindStatus = try await meshManager.send(bind, to: unicastAddress)
+            let bindStatus = try await sendConfigWithTimeout(
+                bind,
+                to: unicastAddress,
+                using: networkKey
+            )
             guard let modelStatus = bindStatus as? ConfigModelAppStatus,
                   isModelBindStatusAcceptable(modelStatus) else {
                 let code = (bindStatus as? ConfigModelAppStatus).map {
@@ -474,7 +499,7 @@ final class IosMeshNetworkBridge: NSObject {
         MeshLog.d("─── AppKey 分发序列完成 ───")
     }
 
-    /// 对齐 Android：优先处理显式队列；否则处理仍缺 AppKey / 模型绑定的节点。
+    /// 对齐 Android：优先处理显式队列；否则仅处理尚未添加 AppKey 的节点。
     private func resolvePendingDeviceNodes() -> [Node] {
         guard let network = meshManager.meshNetwork else { return [] }
         let provisionerUuid = network.localProvisioner?.uuid
@@ -491,7 +516,7 @@ final class IosMeshNetworkBridge: NSObject {
                 guard provisionerUuid == nil || node.uuid != provisionerUuid else {
                     return false
                 }
-                return nodeNeedsConfiguration(node)
+                return node.applicationKeys.isEmpty
             }
         }
 
@@ -500,40 +525,6 @@ final class IosMeshNetworkBridge: NSObject {
                 + "queued=\(queued.map { String(format: "0x%04X", $0) }.joined(separator: ","))"
         )
         return deviceNodes
-    }
-
-    /// 已具备 AppKey 且目标模型均已绑定的设备节点。
-    private func resolveAlreadyConfiguredDeviceNodes() -> [Node] {
-        guard let network = meshManager.meshNetwork else { return [] }
-        let provisionerUuid = network.localProvisioner?.uuid
-        return network.nodes.filter { node in
-            guard provisionerUuid == nil || node.uuid != provisionerUuid else {
-                return false
-            }
-            return isNodeConfigurationComplete(node)
-        }
-    }
-
-    /// 节点是否仍需下发 AppKey / 模型绑定。
-    private func nodeNeedsConfiguration(_ node: Node) -> Bool {
-        if pendingProxyInitializationAddresses.contains(node.primaryUnicastAddress) {
-            return true
-        }
-        if node.applicationKeys.isEmpty { return true }
-        guard let appKey = appKeyObject(at: 0) else { return true }
-        let targets = resolveModelBindTargets(from: node)
-        if targets.isEmpty { return true }
-        return targets.contains { target in
-            !isModelAlreadyBound(
-                nodeAddress: node.primaryUnicastAddress,
-                target: target,
-                appKeyIndex: appKey.index
-            )
-        }
-    }
-
-    private func isNodeConfigurationComplete(_ node: Node) -> Bool {
-        !nodeNeedsConfiguration(node) && !resolveModelBindTargets(from: node).isEmpty
     }
 
     private struct ModelBindTarget {
@@ -1122,11 +1113,16 @@ final class IosMeshNetworkBridge: NSObject {
                     )
                     let resetTask = Task {
                         do {
-                            let response = try await self.meshManager.send(
-                                ConfigNodeReset(),
-                                to: unicastAddress
-                            )
-                            MeshLog.d("DELETE", "ConfigNodeReset 响应: \(type(of: response))")
+                            if let networkKey = self.primaryNetworkKey() {
+                                let response = try await self.meshManager.send(
+                                    ConfigNodeReset(),
+                                    to: unicastAddress,
+                                    using: networkKey
+                                )
+                                MeshLog.d("DELETE", "ConfigNodeReset 响应: \(type(of: response))")
+                            } else {
+                                MeshLog.e("DELETE", "无 NetworkKey，跳过 ConfigNodeReset")
+                            }
                         } catch {
                             MeshLog.d(
                                 "DELETE",
@@ -1222,6 +1218,113 @@ final class IosMeshNetworkBridge: NSObject {
         let appKey = Data.random128BitKey()
         _ = try network.add(applicationKey: appKey, name: "Default App Key")
         _ = meshManager.save()
+    }
+
+    private func primaryNetworkKey() -> NetworkKey? {
+        meshManager.meshNetwork?.networkKeys.first
+    }
+
+    /// 等待 Proxy 通过 Secure Network Beacon 完成 Filter 初始化（对齐 Nordic #689）。
+    private func prepareProxyBeforeConfiguration(
+        targetAddresses: [UInt16],
+        timeout: TimeInterval = 12.0
+    ) async throws {
+        guard let networkKey = primaryNetworkKey() else {
+            throw MeshBridgeError.networkNotReady
+        }
+
+        MeshLog.d("PROXY", "等待 Proxy 中继就绪（Network Beacon → Filter 同步）…")
+        let deadline = Date().addingTimeInterval(timeout)
+        var loggedWait = false
+        var triedManualSetup = false
+        let setupAfter = Date().addingTimeInterval(min(3.0, timeout * 0.5))
+        while Date() < deadline {
+            if isProxyRelayReady(networkKey: networkKey, targetAddresses: targetAddresses) {
+                let proxyAddr = meshManager.proxyFilter.proxy.map {
+                    String(format: "0x%04X", $0.primaryUnicastAddress)
+                } ?? "nil"
+                MeshLog.d(
+                    "PROXY",
+                    "Proxy 已就绪 proxy=\(proxyAddr) "
+                        + "filterSize=\(meshManager.proxyFilter.addresses.count) "
+                        + "beacon=\(proxyBeaconReceivedForCurrentSession)"
+                )
+                break
+            }
+            if !triedManualSetup, Date() >= setupAfter,
+               let provisioner = meshManager.meshNetwork?.localProvisioner {
+                triedManualSetup = true
+                MeshLog.d("PROXY", "尝试手动 setup Proxy Filter（Provisioner 地址）")
+                meshManager.proxyFilter.setup(for: provisioner)
+            }
+            if !loggedWait {
+                MeshLog.d(
+                    "PROXY",
+                    "等待 Secure Network Beacon（自定义 GATT 需设备回传 Beacon 才能配置 Filter）"
+                )
+                loggedWait = true
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        guard isProxyRelayReady(networkKey: networkKey, targetAddresses: targetAddresses) else {
+            throw MeshBridgeError.configFailed(
+                "Proxy 未在 \(Int(timeout))s 内就绪：未收到 Network Beacon 或 Filter 未同步"
+            )
+        }
+
+        for address in targetAddresses {
+            meshManager.proxyFilter.add(address: address)
+            MeshLog.d("PROXY", "Filter 添加目标地址 0x\(String(format: "%04X", address))")
+        }
+        try await Task.sleep(nanoseconds: 600_000_000)
+    }
+
+    private func isProxyRelayReady(
+        networkKey: NetworkKey,
+        targetAddresses: [UInt16] = []
+    ) -> Bool {
+        guard proxyBeaconReceivedForCurrentSession else { return false }
+        guard let proxy = meshManager.proxyFilter.proxy,
+              proxy.knows(networkKey: networkKey) else {
+            return false
+        }
+        if !targetAddresses.isEmpty {
+            return targetAddresses.contains(proxy.primaryUnicastAddress)
+        }
+        if let provisionerAddress = meshManager.meshNetwork?.localProvisioner?
+            .primaryUnicastAddress {
+            return meshManager.proxyFilter.addresses.contains(Address(provisionerAddress))
+        }
+        return true
+    }
+
+    private func sendConfigWithTimeout(
+        _ message: AcknowledgedConfigMessage,
+        to destination: Address,
+        using networkKey: NetworkKey,
+        timeout: TimeInterval = 12.0
+    ) async throws -> ConfigResponse {
+        try await withThrowingTaskGroup(of: ConfigResponse.self) { group in
+            group.addTask {
+                try await self.meshManager.send(
+                    message,
+                    to: destination,
+                    using: networkKey
+                )
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw MeshBridgeError.configFailed(
+                    "\(type(of: message)) 超时（\(Int(timeout))s）"
+                )
+            }
+            guard let result = try await group.next() else {
+                throw MeshBridgeError.configFailed("配置消息无响应")
+            }
+            group.cancelAll()
+            return result
+        }
     }
 
     private func appKeyObject(at index: Int) -> ApplicationKey? {

@@ -1375,9 +1375,6 @@ class _NodeControlPageState extends State<_NodeControlPage> {
     _connSub = _mesh.connectionState.listen(_onConnState);
     _errSub = _mesh.errors.listen(_onError);
     _configSub = _mesh.configurationState.listen(_onConfigState);
-    if (widget.node.appKeyIndexes.isNotEmpty) {
-      _isReady = true;
-    }
     if (widget.autoConnectProxy && widget.node.hasMacAddress) {
       // 配网完成后延迟少许，等待设备重新以 Proxy 模式广播
       Future<void>.delayed(const Duration(seconds: 2), _connectProxy);
@@ -1415,40 +1412,20 @@ class _NodeControlPageState extends State<_NodeControlPage> {
       '[${status.state.name}]${status.message ?? ''}$addrLabel',
       isError: status.state == MeshConfigurationState.failed,
     );
-    if (status.unicastAddress != widget.node.unicastAddress) return;
-
-    setState(() {
-      if (status.state == MeshConfigurationState.complete) {
-        _isReady = true;
-        _isDistributing = false;
-        return;
-      }
-      if (status.state == MeshConfigurationState.failed) {
-        _isDistributing = false;
-        _isReady = false;
-        return;
-      }
-      if (status.state == MeshConfigurationState.proxyConnected ||
-          status.state == MeshConfigurationState.compositionGetting ||
-          status.state == MeshConfigurationState.compositionReceived ||
-          status.state == MeshConfigurationState.appKeyAdding ||
-          status.state == MeshConfigurationState.modelBinding) {
-        _isDistributing = true;
-        _isReady = false;
-      }
-    });
-  }
-
-  void _onConnState(MeshConnectionState state) {
-    if (!mounted) return;
-    setState(() => _connState = state);
-    if (state == MeshConnectionState.connected &&
-        widget.node.appKeyIndexes.isNotEmpty) {
+    if (status.unicastAddress == widget.node.unicastAddress &&
+        status.state == MeshConfigurationState.complete) {
       setState(() {
         _isReady = true;
         _isDistributing = false;
       });
     }
+  }
+
+  void _onConnState(MeshConnectionState state) {
+    if (!mounted) return;
+    setState(() => _connState = state);
+    // AppKey / 模型绑定由 iOS/Android 原生层在 Proxy 连接后自动触发（triggerPendingAutoConfig）。
+    // 此处不再重复调用 distributeAppKey，避免重连 Proxy 时对已配置节点二次下发导致失败。
   }
 
   void _onError(BleMeshException error) {

@@ -804,8 +804,8 @@ class BleMeshNetworkManager(
             mapOf(
                 "address" to group.address,
                 "name" to group.name,
-                "parentAddress" to null,
-            )
+            "parentAddress" to null,
+        )
         } ?: emptyList()
 
     /** 在 Mesh 网络中创建新分组（仅本地存储，无需发送 Mesh 消息）。 */

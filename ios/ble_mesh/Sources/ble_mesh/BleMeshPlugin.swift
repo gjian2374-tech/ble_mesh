@@ -97,18 +97,6 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
     /// Proxy 扫描超时定时器。
     private var proxyConnectTimer: Timer?
 
-    /// 配网后首次 Proxy 连接：强制全量 GATT 服务发现（ESP 无法发 Service Change 时必需）。
-    private var forceRediscoverProxyServices = false
-
-    /// Proxy 服务发现重试次数（单次连接内）。
-    private var proxyServiceDiscoveryAttempts = 0
-
-    /// 配网后 Proxy 重连剩余次数。
-    private var proxyPostProvisionRetriesLeft = 0
-
-    /// 配网后待重连的外设 ID。
-    private var proxyPostProvisionPeripheralId: String?
-
     /// Nordic Mesh 网络桥接（真实 PB-GATT 配网）。
     private var meshBridge: IosMeshNetworkBridge?
 
@@ -297,10 +285,10 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             }
             do {
                 try meshBridge?.createGroup(name: name, address: UInt16(address))
-                groups.removeAll { ($0["address"] as? Int) == address }
-                groups.append(["address": address, "name": name, "parentAddress": nil])
-                sendEvent(["type": "networkUpdated"])
-                result(nil)
+            groups.removeAll { ($0["address"] as? Int) == address }
+            groups.append(["address": address, "name": name, "parentAddress": nil])
+            sendEvent(["type": "networkUpdated"])
+            result(nil)
             } catch {
                 result(FlutterError(
                     code: "GROUP_FAILED",
@@ -316,11 +304,11 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             }
             do {
                 try meshBridge?.deleteGroup(address: UInt16(address))
-                groups.removeAll { ($0["address"] as? Int) == address }
-                subscriptions.removeAll { $0["subscriptionAddress"] == address }
-                publications.removeAll { $0["publishAddress"] == address }
-                sendEvent(["type": "networkUpdated"])
-                result(nil)
+            groups.removeAll { ($0["address"] as? Int) == address }
+            subscriptions.removeAll { $0["subscriptionAddress"] == address }
+            publications.removeAll { $0["publishAddress"] == address }
+            sendEvent(["type": "networkUpdated"])
+            result(nil)
             } catch {
                 result(FlutterError(
                     code: "GROUP_FAILED",
@@ -432,7 +420,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             result(false)
 
         case "supportsAutomaticProxyFilter":
-            result(false)
+            result(true)
 
         case "setProxyFilterType":
             result(false)
@@ -526,22 +514,22 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
                         publishPeriod: publishPeriod
                     )
                     await MainActor.run {
-                        publications.removeAll {
+            publications.removeAll {
                             ($0["nodeAddress"] as? Int) == nodeAddress &&
                             ($0["elementAddress"] as? Int) == elementAddress &&
                             ($0["modelId"] as? Int) == modelId
-                        }
-                        publications.append([
-                            "nodeAddress": nodeAddress,
-                            "elementAddress": elementAddress,
-                            "modelId": modelId,
-                            "publishAddress": publishAddress,
-                            "appKeyIndex": appKeyIndex,
-                            "publishTtl": publishTtl,
-                            "publishPeriod": publishPeriod,
-                        ])
-                        sendEvent(["type": "networkUpdated"])
-                        result(nil)
+            }
+            publications.append([
+                "nodeAddress": nodeAddress,
+                "elementAddress": elementAddress,
+                "modelId": modelId,
+                "publishAddress": publishAddress,
+                "appKeyIndex": appKeyIndex,
+                "publishTtl": publishTtl,
+                "publishPeriod": publishPeriod,
+            ])
+            sendEvent(["type": "networkUpdated"])
+            result(nil)
                     }
                 } catch {
                     await MainActor.run {
@@ -568,7 +556,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             self?.sendEvent(event)
         }
         bridge.onProxyConnectRequested = { [weak self] peripheralId in
-            self?.schedulePostProvisionProxyConnect(peripheralId: peripheralId)
+            self?.handleConnectToProxy(address: peripheralId, result: { _ in })
         }
         meshBridge = bridge
 
@@ -901,7 +889,6 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
 
         let normalizedTarget = address.trimmingCharacters(in: .whitespacesAndNewlines)
         pendingProxyAddress = normalizedTarget
-        enqueueProxyConfiguration(for: normalizedTarget)
 
         if let peripheral = resolvePeripheral(for: normalizedTarget) {
             connectToPeripheral(peripheral, reportedAddress: peripheral.identifier.uuidString)
@@ -1049,41 +1036,6 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "-", with: "")
             .lowercased()
-    }
-
-    /// 手动连 Proxy 前将对应节点加入待配置队列（App 重启后队列会丢失）。
-    private func enqueueProxyConfiguration(for targetAddress: String) {
-        guard let bridge = meshBridge else { return }
-        let trimmed = targetAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        let targetKey = normalizeUuidKey(trimmed)
-        let knownNodes = bridge.getNodes()
-
-        for node in knownNodes {
-            let nodeUuid = normalizeUuidKey((node["uuid"] as? String) ?? "")
-            let nodeMac = ((node["macAddress"] as? String) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let matches = nodeUuid == targetKey
-                || nodeMac.caseInsensitiveCompare(trimmed) == .orderedSame
-                || normalizeUuidKey(nodeMac) == targetKey
-            if matches, let addr = nodeUnicastAddress(from: node) {
-                bridge.enqueuePendingConfiguration(unicastAddress: UInt16(addr))
-                MeshLog.d(
-                    "PROXY",
-                    "connectToProxy 入队配置 0x\(String(format: "%04X", addr))"
-                )
-                return
-            }
-        }
-
-        let looksLikeMac = trimmed.contains(":") && trimmed.count >= 17
-        if looksLikeMac, knownNodes.count == 1,
-           let addr = nodeUnicastAddress(from: knownNodes[0]) {
-            bridge.enqueuePendingConfiguration(unicastAddress: UInt16(addr))
-            MeshLog.d(
-                "PROXY",
-                "单节点网络 connectToProxy 入队 0x\(String(format: "%04X", addr))"
-            )
-        }
     }
 
     /// getNodes 返回的 unicastAddress 可能是 Int 或 UInt16。
@@ -1261,106 +1213,12 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
     }
 
     private func failProxyConnect(message: String) {
-        if retryPostProvisionProxyConnectIfNeeded(reason: message) {
-            return
-        }
         cancelPendingProxyConnect()
         connectedPeripheral = nil
         dataInCharacteristic = nil
         failPendingDelete(message: message)
         sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
         sendEvent(["type": "error", "code": "DEVICE_NOT_FOUND", "message": message])
-    }
-
-    /// 配网完成后延迟扫描连接 Proxy，避免 ESP GATT 服务表未切换完成。
-    private func schedulePostProvisionProxyConnect(peripheralId: String) {
-        MeshLog.d(
-            "PROXY",
-            "配网后自动 Proxy：断开旧 GATT，4s 后扫描连接 id=\(peripheralId)"
-        )
-        forceRediscoverProxyServices = true
-        proxyPostProvisionRetriesLeft = 3
-        proxyPostProvisionPeripheralId = peripheralId
-        invalidatePeripheralCache(for: peripheralId)
-        disconnectProxyGATT()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-            guard let self else { return }
-            self.enqueueProxyConfiguration(for: peripheralId)
-            self.startProxyScan(for: peripheralId)
-        }
-    }
-
-    private func invalidatePeripheralCache(for peripheralId: String) {
-        let trimmed = peripheralId.trimmingCharacters(in: .whitespacesAndNewlines)
-        discoveredPeripherals.removeValue(forKey: trimmed)
-        discoveredPeripherals.removeValue(forKey: trimmed.uppercased())
-        discoveredPeripherals.removeValue(forKey: trimmed.lowercased())
-    }
-
-    private func retryPostProvisionProxyConnectIfNeeded(reason: String) -> Bool {
-        guard proxyPostProvisionRetriesLeft > 0,
-              let peripheralId = proxyPostProvisionPeripheralId else {
-            return false
-        }
-        proxyPostProvisionRetriesLeft -= 1
-        MeshLog.d(
-            "PROXY",
-            "配网后 Proxy 重试(\(proxyPostProvisionRetriesLeft) 次剩余) reason=\(reason)"
-        )
-        forceRediscoverProxyServices = true
-        invalidatePeripheralCache(for: peripheralId)
-        disconnectProxyGATT()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self else { return }
-            self.enqueueProxyConfiguration(for: peripheralId)
-            self.startProxyScan(for: peripheralId)
-        }
-        return true
-    }
-
-    private func clearPostProvisionProxyRetryState() {
-        proxyPostProvisionRetriesLeft = 0
-        proxyPostProvisionPeripheralId = nil
-        forceRediscoverProxyServices = false
-    }
-
-    private func discoverProxyServices(on peripheral: CBPeripheral) {
-        if forceRediscoverProxyServices || proxyServiceDiscoveryAttempts > 0 {
-            MeshLog.d("GATT", "discoverServices(nil) 全量发现 Proxy 服务")
-            peripheral.discoverServices(nil)
-            return
-        }
-        peripheral.discoverServices([kMeshProxyServiceUUID])
-    }
-
-    private func handleMissingProxyService(on peripheral: CBPeripheral) {
-        if proxyServiceDiscoveryAttempts < 2 {
-            proxyServiceDiscoveryAttempts += 1
-            MeshLog.d(
-                "GATT",
-                "未发现 0x1828，全量重试 discoverServices(nil) "
-                    + "attempt=\(proxyServiceDiscoveryAttempts)"
-            )
-            peripheral.discoverServices(nil)
-            return
-        }
-        if retryPostProvisionProxyConnectIfNeeded(
-            reason: "未发现 Mesh Proxy Service（ESP GATT 可能仍在切换）"
-        ) {
-            centralManager?.cancelPeripheralConnection(peripheral)
-            connectedPeripheral = nil
-            dataInCharacteristic = nil
-            return
-        }
-        centralManager?.cancelPeripheralConnection(peripheral)
-        connectedPeripheral = nil
-        dataInCharacteristic = nil
-        sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
-        sendEvent([
-            "type": "error",
-            "code": "NO_PROXY_SERVICE",
-            "message": "设备不支持 Mesh Proxy Service（配网后请稍后重试连接）",
-        ])
     }
 
     /// 删除节点：已连 Proxy 则直接 Reset；否则先自动连接 Proxy 再删除。
@@ -1476,8 +1334,6 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
                 "state": "connected",
                 "address": reportedAddress,
             ])
-            // 已连接时仍需触发配置（避免卡在「等待密钥分发」）。
-            triggerPendingAutoConfig()
             return
         }
 
@@ -1656,8 +1512,7 @@ extension BleMeshPlugin: CBCentralManagerDelegate {
         proxyConnectTimer?.invalidate()
         proxyConnectTimer = nil
         pendingProxyAddress = nil
-        proxyServiceDiscoveryAttempts = 0
-        discoverProxyServices(on: peripheral)
+        peripheral.discoverServices([kMeshProxyServiceUUID])
     }
 
     public func centralManager(
@@ -1704,24 +1559,24 @@ extension BleMeshPlugin: CBPeripheralDelegate {
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil else {
-            if retryPostProvisionProxyConnectIfNeeded(
-                reason: "服务发现失败: \(error!.localizedDescription)"
-            ) {
-                return
-            }
             sendEvent(["type": "error", "code": "SERVICE_DISCOVERY_FAILED", "message": error!.localizedDescription])
             return
         }
 
-        let serviceUuids = (peripheral.services ?? []).map { $0.uuid.uuidString }.joined(separator: ", ")
-        MeshLog.d("GATT", "didDiscoverServices: [\(serviceUuids)]")
-
         guard let proxyService = peripheral.services?.first(where: { $0.uuid == kMeshProxyServiceUUID }) else {
-            handleMissingProxyService(on: peripheral)
+            centralManager?.cancelPeripheralConnection(peripheral)
+            connectedPeripheral = nil
+            dataInCharacteristic = nil
+            sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
+            sendEvent([
+                "type": "error",
+                "code": "NO_PROXY_SERVICE",
+                "message": "设备不支持 Mesh Proxy Service",
+            ])
             return
         }
 
-        forceRediscoverProxyServices = false
+        // 发现代理服务的特征
         peripheral.discoverCharacteristics(
             [kMeshProxyDataInUUID, kMeshProxyDataOutUUID],
             for: proxyService
@@ -1734,13 +1589,6 @@ extension BleMeshPlugin: CBPeripheralDelegate {
         error: Error?
     ) {
         guard error == nil else { return }
-        guard service.uuid == kMeshProxyServiceUUID else {
-            MeshLog.e(
-                "GATT",
-                "忽略非 Proxy 服务特征 service=\(service.uuid.uuidString)"
-            )
-            return
-        }
 
         for characteristic in service.characteristics ?? [] {
             switch characteristic.uuid {
@@ -1764,21 +1612,17 @@ extension BleMeshPlugin: CBPeripheralDelegate {
         error: Error?
     ) {
         if error != nil {
-            let message = error?.localizedDescription ?? "开启 Proxy 通知失败"
-            if retryPostProvisionProxyConnectIfNeeded(reason: message) {
-                return
-            }
             sendEvent([
                 "type": "error",
                 "code": "GATT_ERROR",
-                "message": message,
+                "message": error?.localizedDescription ?? "开启 Proxy 通知失败",
             ])
             return
         }
 
         if characteristic.uuid == kMeshProxyDataOutUUID && characteristic.isNotifying {
             MeshLog.d("Proxy Data Out 通知已开启: \(peripheral.identifier.uuidString)")
-            clearPostProvisionProxyRetryState()
+            // 通知 Nordic 加密栈 Proxy 已就绪（本插件作为 Transmitter）。
             meshBridge?.notifyProxyConnected(transmitter: self)
 
             sendEvent([
@@ -1787,6 +1631,7 @@ extension BleMeshPlugin: CBPeripheralDelegate {
                 "address": peripheral.identifier.uuidString,
             ])
 
+            // 若删除节点时正在等待 Proxy，优先完成 Reset。
             if pendingDeleteUnicastAddress != nil {
                 completePendingDeleteIfNeeded()
             } else {
@@ -1851,8 +1696,8 @@ extension BleMeshPlugin: Transmitter {
 
     /// Proxy 连接就绪后触发自动配置（对齐 Android onProxyConnected）。
     private func triggerPendingAutoConfig() {
-        // ESP Proxy 栈在 GATT 连接后需短暂稳定再发 Config 消息。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        // 等待 Proxy 通知稳定 + 设备发出 Secure Network Beacon（Nordic Filter 初始化依赖此项）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.meshBridge?.onProxyConnected()
         }
     }

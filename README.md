@@ -396,7 +396,7 @@ initializeAndWaitForNetwork
         ↓
    startScan → provisionDevice
         ↓
-  原生自动连 Proxy（iOS ~4s 扫描重连，ESP 需 GATT 切换完成）
+  原生自动连 Proxy（~2.5s）
         ↓
  configurationState.complete（AppKey + Model Bind）
         ↓
@@ -469,17 +469,6 @@ Composition Data 获取成功，待绑定模型数=3
 ```
 
 设备串口（ESP 等）对应：`MODEL_OP_APPKEY_ADD`、`MODEL_OP_MODEL_APP_BIND`、`MODEL_OP_MODEL_SUB_ADD` / `MODEL_OP_MODEL_SUB_DELETE`，组控时 `dst 0xc001`。
-
-#### ESP 配网后卡在 Proxy / 密钥分发
-
-串口若出现 `PROV_COMPLETE` 后仅有 `Connected` + `MTU exchange`，但**没有**后续 Mesh Config 日志，常见原因：
-
-1. **GATT 服务切换**：配网用 `0x1827`，配置用 `0x1828`。ESP 报错  
-   `GATT_SendServiceChangeIndication can't send service change indication` 时，iOS 会缓存旧 GATT 表。  
-   **固件侧**建议在 `menuconfig` 启用 `BT_GATTS_SEND_SERVICE_CHANGE_MANUALLY` 或正确配置 Service Change 特性。  
-   **插件侧**（iOS）配网后会延迟 ~4s、扫描重连并 `discoverServices(nil)` 全量发现。
-
-2. **验证**：Xcode 应看到 `didDiscoverServices: [1828]` → `Proxy Data Out 通知已开启` → `分发 AppKey`。
 
 ### Android
 
