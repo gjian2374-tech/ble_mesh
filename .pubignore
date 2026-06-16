@@ -1,0 +1,9 @@
+build/
+**/build/
+.dart_tool/
+**/.dart_tool/
+example/android/build/
+example/android/.gradle/
+example/ios/Pods/
+example/build/
+.metadata
