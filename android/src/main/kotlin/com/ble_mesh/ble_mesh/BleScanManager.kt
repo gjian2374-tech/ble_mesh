@@ -12,6 +12,9 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.UUID
+import kotlin.coroutines.resume
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
  * BLE 扫描管理器。
@@ -153,6 +156,89 @@ class BleScanManager(
         }
         isScanning = false
         Log.d(TAG, "扫描已停止")
+    }
+
+    /**
+     * 主动扫描 Mesh Proxy Service，直到目标 MAC 开始广播或超时。
+     *
+     * 配网后设备需从 PB-GATT (0x1827) 切换到 Proxy (0x1828)，固定等待会浪费 1–2s；
+     * 一旦检测到 Proxy 广播即可立即发起 GATT 连接。
+     *
+     * @param targetMac 目标设备 MAC 地址。
+     * @param minDelayMs 最短等待时间，给设备切换广播留出窗口。
+     * @param timeoutMs 扫描超时。
+     * @return 是否在超时前检测到 Proxy 广播。
+     */
+    suspend fun waitForProxyAdvertisement(
+        targetMac: String,
+        minDelayMs: Long = 400L,
+        timeoutMs: Long = 4_000L,
+    ): Boolean {
+        delay(minDelayMs)
+
+        val adapter = bluetoothAdapter
+        if (adapter == null || !adapter.isEnabled) return false
+
+        val normalized = targetMac.uppercase()
+        val scanner = adapter.bluetoothLeScanner ?: return false
+
+        if (isScanning) stopScan()
+
+        return suspendCancellableCoroutine { cont ->
+            var timeoutRunnable: Runnable? = null
+
+            val callback = object : ScanCallback() {
+                override fun onScanResult(callbackType: Int, result: ScanResult) {
+                    if (result.device.address.uppercase() == normalized) {
+                        Log.d(TAG, "检测到 Proxy 广播: $normalized RSSI=${result.rssi}")
+                        cleanup()
+                        if (cont.isActive) cont.resume(true)
+                    }
+                }
+
+                override fun onScanFailed(errorCode: Int) {
+                    Log.w(TAG, "Proxy 等待扫描失败: $errorCode")
+                    cleanup()
+                    if (cont.isActive) cont.resume(false)
+                }
+
+                fun cleanup() {
+                    timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                    try {
+                        scanner.stopScan(this)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+
+            timeoutRunnable = Runnable {
+                Log.d(TAG, "Proxy 广播扫描超时 ($timeoutMs ms): $normalized")
+                callback.cleanup()
+                if (cont.isActive) cont.resume(false)
+            }
+
+            val filters = listOf(
+                ScanFilter.Builder()
+                    .setServiceUuid(ParcelUuid(MESH_PROXY_UUID))
+                    .build(),
+            )
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build()
+
+            try {
+                scanner.startScan(filters, settings, callback)
+                mainHandler.postDelayed(timeoutRunnable!!, timeoutMs)
+            } catch (e: Exception) {
+                Log.w(TAG, "启动 Proxy 扫描失败: ${e.message}")
+                if (cont.isActive) cont.resume(false)
+                return@suspendCancellableCoroutine
+            }
+
+            cont.invokeOnCancellation {
+                callback.cleanup()
+            }
+        }
     }
 
     // ── 私有方法 ───────────────────────────────────────────────────────────────

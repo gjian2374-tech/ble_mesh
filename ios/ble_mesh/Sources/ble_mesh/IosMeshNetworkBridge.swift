@@ -262,8 +262,8 @@ final class IosMeshNetworkBridge: NSObject {
                    "node": buildNodeMap(node: node, peripheralId: peripheralId)])
         sendEvent(["type": "networkUpdated"])
         pendingProxyInitializationAddresses.insert(node.primaryUnicastAddress)
-        // 等待设备从 PB-GATT 切换到 Proxy 广播（对齐 Android 2.5s 延迟）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+        // 短暂等待后发起 Proxy 连接；handleConnectToProxy 会扫描 0x1828 直到设备就绪
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.onProxyConnectRequested?(peripheralId)
         }
     }
@@ -425,7 +425,7 @@ final class IosMeshNetworkBridge: NSObject {
         }
 
         MeshLog.d("─── 开始向节点 0x\(String(format: "%04X", unicastAddress)) 分发 AppKey ───")
-        try await Task.sleep(nanoseconds: 400_000_000)
+        try await Task.sleep(nanoseconds: 120_000_000)
 
         let response = try await sendConfigWithTimeout(
             ConfigCompositionDataGet(),
@@ -448,7 +448,7 @@ final class IosMeshNetworkBridge: NSObject {
                 "GROUP",
                 "等待 Composition 同步到 node.elements attempt=\(attempt)/10"
             )
-            try await Task.sleep(nanoseconds: 200_000_000)
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
         MeshLog.d("Composition Data 获取成功，待绑定模型数=\(bindTargets.count)")
         if bindTargets.isEmpty {
@@ -457,7 +457,7 @@ final class IosMeshNetworkBridge: NSObject {
             )
         }
 
-        try await Task.sleep(nanoseconds: 300_000_000)
+        try await Task.sleep(nanoseconds: 100_000_000)
         MeshLog.d("发送 ConfigAppKeyAdd → 0x\(String(format: "%04X", unicastAddress))")
         let appKeyStatus = try await sendConfigWithTimeout(
             ConfigAppKeyAdd(applicationKey: appKey),
@@ -473,7 +473,7 @@ final class IosMeshNetworkBridge: NSObject {
             )
         }
 
-        try await Task.sleep(nanoseconds: 300_000_000)
+        try await Task.sleep(nanoseconds: 100_000_000)
         for target in bindTargets {
             if isModelAlreadyBound(nodeAddress: unicastAddress, target: target, appKeyIndex: appKey.index) {
                 MeshLog.d("GROUP", "跳过已绑定: \(target.label)")
@@ -500,7 +500,7 @@ final class IosMeshNetworkBridge: NSObject {
                     "模型绑定失败: \(target.label) status=0x\(code)"
                 )
             }
-            try await Task.sleep(nanoseconds: 200_000_000)
+            try await Task.sleep(nanoseconds: 60_000_000)
         }
         MeshLog.d("─── AppKey 分发序列完成 ───")
     }
@@ -1287,7 +1287,7 @@ final class IosMeshNetworkBridge: NSObject {
         let deadline = Date().addingTimeInterval(timeout)
         var loggedWait = false
         var triedManualSetup = false
-        let setupAfter = Date().addingTimeInterval(min(3.0, timeout * 0.5))
+        let setupAfter = Date().addingTimeInterval(min(1.0, timeout * 0.25))
         while Date() < deadline {
             if isProxyRelayReady(networkKey: networkKey, targetAddresses: targetAddresses) {
                 let proxyAddr = meshManager.proxyFilter.proxy.map {
@@ -1314,7 +1314,7 @@ final class IosMeshNetworkBridge: NSObject {
                 )
                 loggedWait = true
             }
-            try await Task.sleep(nanoseconds: 200_000_000)
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
 
         guard isProxyRelayReady(networkKey: networkKey, targetAddresses: targetAddresses) else {
@@ -1327,7 +1327,7 @@ final class IosMeshNetworkBridge: NSObject {
             meshManager.proxyFilter.add(address: address)
             MeshLog.d("PROXY", "Filter 添加目标地址 0x\(String(format: "%04X", address))")
         }
-        try await Task.sleep(nanoseconds: 600_000_000)
+        try await Task.sleep(nanoseconds: 150_000_000)
     }
 
     private func isProxyRelayReady(

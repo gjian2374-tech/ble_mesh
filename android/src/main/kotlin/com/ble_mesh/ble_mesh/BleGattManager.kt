@@ -77,6 +77,10 @@ class BleGattManager(
     /** Data In 特征，用于向节点写入数据。 */
     private var dataInCharacteristic: BluetoothGattCharacteristic? = null
 
+    /** Proxy 通知已开启（与 Dart 层 connectionState=connected 事件对齐）。 */
+    @Volatile
+    private var proxyNotificationsReady = false
+
     /**
      * 待发送 PDU 队列。
      *
@@ -115,6 +119,7 @@ class BleGattManager(
                     Log.d(TAG, "GATT 连接已断开")
                     targetAddress = null
                     dataInCharacteristic = null
+                    proxyNotificationsReady = false
                     synchronized(writeQueue) {
                         writeQueue.clear()
                         isWriting = false
@@ -206,6 +211,7 @@ class BleGattManager(
         ) {
             if (descriptor.uuid == CCCD_UUID && status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "通知已开启，代理连接就绪")
+                proxyNotificationsReady = true
                 MeshEventStreamHandler.sendConnectionState("connected", gatt.device.address)
                 // Proxy 就绪后自动触发 AppKey 分发（首次配网后立即可控制）
                 networkManager.onProxyConnected()
@@ -239,6 +245,8 @@ class BleGattManager(
         val device: BluetoothDevice = adapter.getRemoteDevice(address)
         Log.d(TAG, "连接代理节点: $address")
         targetAddress = normalizedAddress
+        proxyNotificationsReady = false
+        dataInCharacteristic = null
 
         // 断开已有连接
         bluetoothGatt?.disconnect()
@@ -263,6 +271,8 @@ class BleGattManager(
             isWriting = false
         }
         targetAddress = null
+        proxyNotificationsReady = false
+        dataInCharacteristic = null
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
@@ -272,7 +282,8 @@ class BleGattManager(
     /** 是否已连接到指定 MAC 且 Proxy 通道就绪。 */
     fun isReadyForProxy(address: String): Boolean {
         val normalized = address.uppercase()
-        return connectionState == BluetoothProfile.STATE_CONNECTED &&
+        return proxyNotificationsReady &&
+            connectionState == BluetoothProfile.STATE_CONNECTED &&
             targetAddress == normalized &&
             dataInCharacteristic != null
     }
@@ -309,8 +320,8 @@ class BleGattManager(
 
     /** 返回与 Dart [MeshConnectionState] 对应的连接状态字符串。 */
     fun getMeshConnectionState(): String = when {
-        connectionState == BluetoothProfile.STATE_CONNECTED &&
-            dataInCharacteristic != null -> "connected"
+        proxyNotificationsReady &&
+            connectionState == BluetoothProfile.STATE_CONNECTED -> "connected"
         connectionState == BluetoothProfile.STATE_CONNECTING -> "connecting"
         else -> "disconnected"
     }

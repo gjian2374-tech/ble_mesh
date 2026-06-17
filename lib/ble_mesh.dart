@@ -330,6 +330,16 @@ class BleMesh {
     }
   }
 
+  /// 指定蓝牙地址的 Proxy 是否已就绪（通知已开启、可收发 Mesh PDU）。
+  Future<bool> isProxyReady(String address) async {
+    _ensureInitialized();
+    try {
+      return await _platform.isProxyReady(address);
+    } on PlatformException catch (e) {
+      throw _mapPlatformException(e);
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // 5. 节点管理
   // ═══════════════════════════════════════════════════════════════════════════

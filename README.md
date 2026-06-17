@@ -37,7 +37,7 @@ Flutter (Dart)
 | **Control** | Proxy GATT (0x1828) → Nordic encryption stack → unicast/multicast Mesh messages |
 | **Grouping** | Create group → `ConfigModelSubscriptionAdd` / `Delete` → send control messages to group address |
 
-After provisioning completes, the **native layer automatically connects to Proxy and distributes AppKey / model bindings** (with ~2.5s delay waiting for the device to switch advertising). The Dart layer should listen to `configurationState` and wait for `complete` — **do not call `distributeAppKey()` on every Proxy connection**.
+After provisioning completes, the **native layer automatically connects to Proxy and distributes AppKey / model bindings** (actively scans for Proxy advertising instead of a fixed wait). The Dart layer should listen to `configurationState` and wait for `complete` — **do not call `distributeAppKey()` on every Proxy connection**.
 
 ## Installation
 
@@ -139,7 +139,7 @@ try {
 After successful provisioning, the native layer will:
 
 1. Add the node to the pending configuration queue
-2. Automatically connect to Proxy after ~2.5s
+2. Actively scan for Proxy advertising, then connect as soon as the device is ready
 3. After Proxy is ready, send Composition → AppKey Add → Model Bind
 
 The Dart layer only needs to listen to `configurationState`:
@@ -169,9 +169,14 @@ Control messages require connecting to the node's **Mesh Proxy Service** first. 
 
 ```dart
 if (node.macAddress != null) {
-  await mesh.connectToProxy(node.macAddress!);
+  final mac = node.macAddress!;
+  if (!await mesh.isProxyReady(mac)) {
+    await mesh.connectToProxy(mac);
+  }
 }
 ```
+
+Use `isProxyReady(address)` to check whether the Proxy channel is fully ready (GATT connected, notifications enabled, Mesh PDUs can be sent/received) without waiting on `connectionState` events. This is useful when restoring UI after app launch or before sending control messages.
 
 > **Note**: The native layer persists Mesh UUID → peripheral UUID mapping to `UserDefaults` (iOS) / in-memory cache (Android). After a cold start, `getNodes()` usually restores `macAddress`. If iOS cannot `retrievePeripherals` (device not discovered by this app for a long time), you need to scan again before connecting to Proxy.
 
@@ -397,7 +402,7 @@ initializeAndWaitForNetwork
         ↓
    startScan → provisionDevice
         ↓
-  Native auto-connects Proxy (~2.5s)
+  Native auto-connects Proxy (active scan, typically ~0.5–2s)
         ↓
  configurationState.complete (AppKey + Model Bind)
         ↓
@@ -525,6 +530,8 @@ Minimum system version: **iOS 13.0**.
 | `startScan()` / `stopScan()` | Scan for unprovisioned devices |
 | `provisionDevice()` / `cancelProvisioning()` | Provisioning |
 | `connectToProxy()` / `disconnectFromProxy()` | Proxy connection (Bluetooth address string) |
+| `getConnectionState()` | Query current Proxy connection state (no event stream needed) |
+| `isProxyReady()` | Check if Proxy for a given Bluetooth address is ready (notifications on, PDUs can flow) |
 | `distributeAppKey()` | Manually trigger AppKey configuration (for retry on failure) |
 | `sendGenericOnOff()` / `sendGenericLevel()` | SIG model control |
 | `getNodes()` / `deleteNode()` | Node management |

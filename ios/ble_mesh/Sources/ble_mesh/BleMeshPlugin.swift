@@ -54,6 +54,9 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
     /// Data In 特征，用于向代理节点写入数据。
     private var dataInCharacteristic: CBCharacteristic?
 
+    /// Proxy Data Out 通知已开启（与 Android proxyNotificationsReady 对齐）。
+    private var proxyNotificationsReady = false
+
     /// GATT Proxy 写入队列（对齐 Android BleGattManager.writeQueue 串行写）。
     private var proxyWriteQueue: [Data] = []
     private var proxyWriteInProgress = false
@@ -206,6 +209,13 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
 
         case "getConnectionState":
             result(resolveConnectionState())
+
+        case "isProxyReady":
+            guard let address = args?["address"] as? String else {
+                result(FlutterError(code: "INVALID_ARGUMENT", message: "缺少 address 参数", details: nil))
+                return
+            }
+            result(isProxyReady(for: address))
 
         case "getNetworkInfo":
             result(buildNetworkInfo())
@@ -585,13 +595,27 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
     }
 
     private func resolveConnectionState() -> String {
-        if connectedPeripheral != nil, dataInCharacteristic != nil {
+        if proxyNotificationsReady,
+           connectedPeripheral != nil,
+           dataInCharacteristic != nil {
             return "connected"
         }
         if connectedPeripheral != nil {
             return "connecting"
         }
         return "disconnected"
+    }
+
+    private func isProxyReady(for address: String) -> Bool {
+        guard proxyNotificationsReady,
+              let connected = connectedPeripheral,
+              dataInCharacteristic != nil else {
+            return false
+        }
+        guard let target = resolvePeripheral(for: address) else {
+            return false
+        }
+        return connected.identifier == target.identifier
     }
 
     private func buildNetworkInfo() -> [String: Any] {
@@ -927,6 +951,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
         }
         connectedPeripheral = nil
         dataInCharacteristic = nil
+        proxyNotificationsReady = false
         if !hadConnection {
             MeshLog.d("GATT", "无活跃连接，无需等待 didDisconnect")
         }
@@ -1218,7 +1243,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
         central.stopScan()
         central.scanForPeripherals(
             withServices: [kMeshProxyServiceUUID],
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
 
         proxyConnectTimer = Timer.scheduledTimer(
@@ -1240,6 +1265,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
         cancelPendingProxyConnect()
         connectedPeripheral = nil
         dataInCharacteristic = nil
+        proxyNotificationsReady = false
         failPendingDelete(message: message)
         sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
         sendEvent(["type": "error", "code": "DEVICE_NOT_FOUND", "message": message])
@@ -1352,6 +1378,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
 
         if let current = connectedPeripheral,
            current.identifier == peripheral.identifier,
+           proxyNotificationsReady,
            dataInCharacteristic != nil {
             sendEvent([
                 "type": "connectionStateChanged",
@@ -1369,6 +1396,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
         connectedPeripheral = peripheral
         peripheral.delegate = self
         dataInCharacteristic = nil
+        proxyNotificationsReady = false
 
         sendEvent([
             "type": "connectionStateChanged",
@@ -1569,6 +1597,7 @@ extension BleMeshPlugin: CBCentralManagerDelegate {
         )
         connectedPeripheral = nil
         dataInCharacteristic = nil
+        proxyNotificationsReady = false
         clearProxyWriteQueue()
         meshBridge?.notifyProxyDisconnected()
         sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
@@ -1591,6 +1620,7 @@ extension BleMeshPlugin: CBPeripheralDelegate {
             centralManager?.cancelPeripheralConnection(peripheral)
             connectedPeripheral = nil
             dataInCharacteristic = nil
+            proxyNotificationsReady = false
             sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
             sendEvent([
                 "type": "error",
@@ -1646,6 +1676,7 @@ extension BleMeshPlugin: CBPeripheralDelegate {
 
         if characteristic.uuid == kMeshProxyDataOutUUID && characteristic.isNotifying {
             MeshLog.d("Proxy Data Out 通知已开启: \(peripheral.identifier.uuidString)")
+            proxyNotificationsReady = true
             // 通知 Nordic 加密栈 Proxy 已就绪（本插件作为 Transmitter）。
             meshBridge?.notifyProxyConnected(transmitter: self)
 
@@ -1718,10 +1749,10 @@ extension BleMeshPlugin: Transmitter {
 
     // MARK: - 自动配置触发
 
-    /// Proxy 连接就绪后触发自动配置（对齐 Android onProxyConnected）。
+    /// Proxy 连接就绪后触发自动配置。
+    /// `prepareProxyBeforeConfiguration` 会轮询 Network Beacon，无需额外固定等待。
     private func triggerPendingAutoConfig() {
-        // 等待 Proxy 通知稳定 + 设备发出 Secure Network Beacon（Nordic Filter 初始化依赖此项）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             self?.meshBridge?.onProxyConnected()
         }
     }

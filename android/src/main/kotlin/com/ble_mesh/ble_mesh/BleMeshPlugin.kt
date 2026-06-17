@@ -159,6 +159,12 @@ class BleMeshPlugin :
 
             "getConnectionState" -> handleGetConnectionState(result)
 
+            "isProxyReady" -> {
+                val address = call.argument<String>("address")
+                    ?: return result.error("INVALID_ARGUMENT", "缺少 address 参数", null)
+                handleIsProxyReady(address, result)
+            }
+
             "getNetworkInfo" -> handleGetNetworkInfo(result)
 
             "exportNetworkJson" -> handleExportNetworkJson(result)
@@ -302,6 +308,7 @@ class BleMeshPlugin :
             // 双向注入：GATT 管理器需要网络管理器（解析 PDU），
             // 网络管理器需要 GATT 管理器（发送 Mesh PDU）
             networkManager!!.gattManager = gattManager
+            networkManager!!.scanManager = scanManager
 
             result.success(null)
         } catch (e: Exception) {
@@ -370,6 +377,12 @@ class BleMeshPlugin :
         val manager = networkManager
             ?: return result.error("NOT_INITIALIZED", "请先调用 initialize()", null)
         result.success(manager.getConnectionState())
+    }
+
+    private fun handleIsProxyReady(address: String, result: Result) {
+        val manager = networkManager
+            ?: return result.error("NOT_INITIALIZED", "请先调用 initialize()", null)
+        result.success(manager.isProxyReady(address))
     }
 
     private fun handleGetNetworkInfo(result: Result) {

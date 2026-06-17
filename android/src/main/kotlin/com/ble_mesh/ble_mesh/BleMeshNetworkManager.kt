@@ -75,6 +75,17 @@ class BleMeshNetworkManager(
         private const val CONFIG_TIMEOUT_MS = 8_000L
         private const val DEFAULT_APP_KEY_INDEX = 0
 
+        /** 配网后等待 Proxy 广播的最短间隔（设备切换 PB-GATT → Proxy）。 */
+        private const val PROXY_MIN_SWITCH_MS = 400L
+
+        /** 配网后扫描 Proxy 广播的最长等待。 */
+        private const val PROXY_SCAN_TIMEOUT_MS = 4_000L
+
+        /** 配置消息之间的间隔（过短可能导致设备丢包）。 */
+        private const val CONFIG_STEP_DELAY_MS = 100L
+        private const val CONFIG_BIND_DELAY_MS = 60L
+        private const val CONFIG_INITIAL_DELAY_MS = 120L
+
         /** 配网完成后自动绑定 AppKey 的 SIG Model IDs（16 位）。 */
         private val SIG_MODELS_TO_BIND = listOf(
             0x1000, // Generic OnOff Server
@@ -107,6 +118,9 @@ class BleMeshNetworkManager(
 
     /** 代理通信 GATT 管理器，由 [BleMeshPlugin] 注入。 */
     var gattManager: BleGattManager? = null
+
+    /** BLE 扫描管理器，用于配网后主动检测 Proxy 广播。 */
+    var scanManager: BleScanManager? = null
 
     // ── 临时状态 ──────────────────────────────────────────────────────────────
 
@@ -660,6 +674,10 @@ class BleMeshNetworkManager(
     /** 查询当前 Proxy 连接状态。 */
     fun getConnectionState(): String =
         gattManager?.getMeshConnectionState() ?: "disconnected"
+
+    /** 指定地址的 Proxy 是否已就绪（通知已开启）。 */
+    fun isProxyReady(address: String): Boolean =
+        gattManager?.isReadyForProxy(address) ?: false
 
     /** 返回 nRF Mesh App 首页风格的网络摘要信息。 */
     fun getNetworkInfo(): Map<String, Any?> {
@@ -1463,7 +1481,7 @@ class BleMeshNetworkManager(
         Log.d(TAG, "─── 开始向节点 0x${unicastAddress.toString(16)} 分发 AppKey ───")
         Log.d(TAG, "AppKey 索引=${appKey.keyIndex}, NetKey 索引=${netKey.keyIndex}")
 
-        kotlinx.coroutines.delay(400)
+        kotlinx.coroutines.delay(CONFIG_INITIAL_DELAY_MS)
         val compositionStatus = fetchCompositionData(meshNode)
         val bindTargets = resolveModelBindTargets(compositionStatus)
         Log.d(
@@ -1471,15 +1489,15 @@ class BleMeshNetworkManager(
             "Composition Data 获取成功，待绑定模型数=${bindTargets.size}",
         )
 
-        kotlinx.coroutines.delay(300)
+        kotlinx.coroutines.delay(CONFIG_STEP_DELAY_MS)
         Log.d(TAG, "发送 ConfigAppKeyAdd → 0x${unicastAddress.toString(16)}")
         addAppKeyWithStatus(meshNode, netKey, appKey)
 
-        kotlinx.coroutines.delay(300)
+        kotlinx.coroutines.delay(CONFIG_STEP_DELAY_MS)
         for (target in bindTargets) {
             Log.d(TAG, target.label)
             bindModelWithStatus(meshNode, target, appKey.keyIndex)
-            kotlinx.coroutines.delay(200)
+            kotlinx.coroutines.delay(CONFIG_BIND_DELAY_MS)
         }
         Log.d(TAG, "─── AppKey 分发序列完成（SIG×${SIG_MODELS_TO_BIND.size} + Vendor×${VENDOR_MODELS_TO_BIND.size}）───")
     }
@@ -1510,8 +1528,25 @@ class BleMeshNetworkManager(
                     message = "准备自动连接 Proxy: $macAddress",
                 )
 
-                // 等待设备从 PB-GATT 切换到 Proxy 广播
-                kotlinx.coroutines.delay(2500)
+                // 主动扫描 Proxy 广播，检测到后立即连接（替代固定 2.5s 等待）
+                val scanner = scanManager
+                if (scanner != null) {
+                    val found = scanner.waitForProxyAdvertisement(
+                        targetMac = macAddress,
+                        minDelayMs = PROXY_MIN_SWITCH_MS,
+                        timeoutMs = PROXY_SCAN_TIMEOUT_MS,
+                    )
+                    Log.d(
+                        TAG,
+                        if (found) {
+                            "已检测到 Proxy 广播，立即连接"
+                        } else {
+                            "Proxy 扫描超时，仍尝试 GATT 连接"
+                        },
+                    )
+                } else {
+                    kotlinx.coroutines.delay(800)
+                }
 
                 val gatt = gattManager ?: throw IllegalStateException("BleGattManager 未初始化")
                 if (gatt.isReadyForProxy(macAddress)) {

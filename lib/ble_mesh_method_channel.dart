@@ -105,6 +105,14 @@ class MethodChannelBleMesh extends BleMeshPlatform {
   }
 
   @override
+  Future<bool> isProxyReady(String address) async {
+    final ready = await methodChannel.invokeMethod<bool>('isProxyReady', {
+      'address': address,
+    });
+    return ready ?? false;
+  }
+
+  @override
   Future<Map<dynamic, dynamic>> getNetworkInfo() async {
     final result = await methodChannel.invokeMethod<Map>('getNetworkInfo');
     return result?.cast<dynamic, dynamic>() ?? <dynamic, dynamic>{};

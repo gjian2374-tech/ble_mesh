@@ -45,6 +45,8 @@ abstract class BleMeshPlatform extends PlatformInterface {
 
   Future<String> getConnectionState();
 
+  Future<bool> isProxyReady(String address);
+
   Future<Map<dynamic, dynamic>> getNetworkInfo();
 
   Future<String> exportNetworkJson();
