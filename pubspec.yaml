@@ -1,6 +1,6 @@
 name: ble_mesh
 description: Flutter BLE Mesh plugin for Android/iOS using Nordic nRF Mesh. PB-GATT provisioning, Proxy connections, and group control.
-version: 0.0.1
+version: 1.0.0
 homepage: https://github.com/gjian2374-tech/ble_mesh
 repository: https://github.com/gjian2374-tech/ble_mesh
 issue_tracker: https://github.com/gjian2374-tech/ble_mesh/issues
