@@ -41,6 +41,103 @@ final class IosMeshNetworkBridge: NSObject {
     // -- 外设缓存 --
     private var peripheralIdByNodeKey: [String: String] = [:]
 
+    /// Composition 同步可能清空 Nordic DB 中的订阅/发布，overlay 供 getNodes 合并返回。
+    private struct ModelConfigOverlay {
+        var publishAddress: Int = 0
+        var subscriptionAddresses: [Int] = []
+    }
+
+    private var modelConfigOverlay: [String: ModelConfigOverlay] = [:]
+
+    private func modelOverlayKey(
+        nodeAddress: UInt16,
+        elementAddress: UInt16,
+        modelId: Int
+    ) -> String {
+        "\(nodeAddress):\(elementAddress):\(modelId)"
+    }
+
+    private func dynamicGroupSubscriptionAddresses(from model: Model) -> [Int] {
+        model.subscriptions
+            .map { Int($0.address.address) }
+            .filter { (0xC000...0xFEFF).contains($0) }
+    }
+
+    private func rememberModelConfigOverlay(
+        nodeAddress: UInt16,
+        elementAddress: UInt16,
+        modelId: Int,
+        publishAddress: Int? = nil,
+        subscriptionAddresses: [Int]? = nil
+    ) {
+        let key = modelOverlayKey(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            modelId: modelId
+        )
+        var existing = modelConfigOverlay[key] ?? ModelConfigOverlay()
+        if let publishAddress {
+            existing.publishAddress = publishAddress
+        }
+        if let subscriptionAddresses {
+            existing.subscriptionAddresses = subscriptionAddresses
+        }
+        modelConfigOverlay[key] = existing
+    }
+
+    private func rememberModelConfigOverlay(
+        nodeAddress: UInt16,
+        elementAddress: UInt16,
+        model: Model
+    ) {
+        let modelId: Int
+        if let cid = model.companyIdentifier {
+            modelId = (Int(cid) << 16) | Int(model.modelIdentifier)
+        } else {
+            modelId = Int(model.modelIdentifier)
+        }
+        let publishAddress = Int(model.publish?.publicationAddress.address ?? 0)
+        let subscriptionAddresses = dynamicGroupSubscriptionAddresses(from: model)
+        rememberModelConfigOverlay(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            modelId: modelId,
+            publishAddress: publishAddress,
+            subscriptionAddresses: subscriptionAddresses
+        )
+    }
+
+    private func resolvedModelConfig(
+        nodeAddress: UInt16,
+        elementAddress: UInt16,
+        modelId: Int,
+        model: Model
+    ) -> ModelConfigOverlay {
+        let fromModel = ModelConfigOverlay(
+            publishAddress: Int(model.publish?.publicationAddress.address ?? 0),
+            subscriptionAddresses: dynamicGroupSubscriptionAddresses(from: model)
+        )
+        let key = modelOverlayKey(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            modelId: modelId
+        )
+        guard let overlay = modelConfigOverlay[key] else {
+            if fromModel.publishAddress != 0 || !fromModel.subscriptionAddresses.isEmpty {
+                modelConfigOverlay[key] = fromModel
+            }
+            return fromModel
+        }
+        return ModelConfigOverlay(
+            publishAddress: overlay.publishAddress != 0
+                ? overlay.publishAddress
+                : fromModel.publishAddress,
+            subscriptionAddresses: overlay.subscriptionAddresses.isEmpty
+                ? fromModel.subscriptionAddresses
+                : overlay.subscriptionAddresses
+        )
+    }
+
     /// 配网完成后请求 Proxy 重连的回调（传入外设 UUID）。
     var onProxyConnectRequested: ((String) -> Void)?
 
@@ -659,7 +756,7 @@ final class IosMeshNetworkBridge: NSObject {
         MeshLog.d("GROUP", "ConfigModelAppBind 成功")
     }
 
-    /// 发送 ConfigModelPublicationSet：配置模型发布地址（Sync Group 主机等）。
+    /// 发送 ConfigModelPublicationSet：配置模型发布地址。
     func setModelPublication(
         nodeAddress: UInt16,
         elementAddress: UInt16,
@@ -685,40 +782,54 @@ final class IosMeshNetworkBridge: NSObject {
                 )
             }
         }
-
-        let isVendor = modelId > 0xFFFF
-        let sigId = UInt16(modelId & 0xFFFF)
-        let cid: UInt16? = isVendor ? UInt16((modelId >> 16) & 0xFFFF) : nil
-
-        let periodSteps: UInt8
-        let periodResolution: StepResolution
-        if publishPeriod <= 0 {
-            periodSteps = 0
-            periodResolution = .hundredsOfMilliseconds
-        } else if publishPeriod <= 6300 {
-            periodSteps = UInt8(min(publishPeriod / 100, 63))
-            periodResolution = .hundredsOfMilliseconds
-        } else {
-            let period = Publish.Period(TimeInterval(publishPeriod) / 1000.0)
-            periodSteps = period.numberOfSteps
-            periodResolution = period.resolution
+        guard let model = findModel(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            modelId: modelId
+        ) else {
+            throw MeshBridgeError.configFailed("未找到目标模型")
         }
 
-        let pub = DirectConfigModelPublicationSet(
-            elementAddress: elementAddress,
-            modelIdentifier: sigId,
-            companyIdentifier: cid,
-            publishAddress: publishAddress,
-            appKeyIndex: appKey.index,
-            ttl: UInt8(clamping: publishTtl),
-            periodSteps: periodSteps,
-            periodResolution: periodResolution
-        )
+        let pub: ConfigModelPublicationSet
+        if publishAddress == 0 {
+            guard let disable = ConfigModelPublicationSet(disablePublicationFor: model) else {
+                throw MeshBridgeError.configFailed("无法构造清除发布消息")
+            }
+            pub = disable
+        } else {
+            let periodSteps: UInt8
+            let periodResolution: StepResolution
+            if publishPeriod <= 0 {
+                periodSteps = 0
+                periodResolution = .hundredsOfMilliseconds
+            } else if publishPeriod <= 6300 {
+                periodSteps = UInt8(min(publishPeriod / 100, 63))
+                periodResolution = .hundredsOfMilliseconds
+            } else {
+                let period = Publish.Period(TimeInterval(publishPeriod) / 1000.0)
+                periodSteps = period.numberOfSteps
+                periodResolution = period.resolution
+            }
+            let period = Publish.Period(steps: periodSteps, resolution: periodResolution)
+            let retransmit = Publish.Retransmit(publishRetransmitCount: 0, intervalSteps: 0)
+            let publish = Publish(
+                to: MeshAddress(publishAddress),
+                using: appKey,
+                usingFriendshipMaterial: false,
+                ttl: UInt8(clamping: publishTtl),
+                period: period,
+                retransmit: retransmit
+            )
+            guard let set = ConfigModelPublicationSet(publish, to: model) else {
+                throw MeshBridgeError.configFailed("无法构造发布消息")
+            }
+            pub = set
+        }
 
         MeshLog.d(
             "GROUP",
             "发送 ConfigModelPublicationSet → node=0x\(String(format: "%04X", nodeAddress)) "
-                + "model=0x\(String(format: "%04X", sigId)) "
+                + "model=0x\(String(format: "%04X", model.modelIdentifier)) "
                 + "publish=0x\(String(format: "%04X", publishAddress)) "
                 + "ttl=\(publishTtl) period=\(publishPeriod)"
         )
@@ -734,13 +845,19 @@ final class IosMeshNetworkBridge: NSObject {
             )
         }
         _ = meshManager.save()
+        sendEvent(["type": "networkUpdated"])
+        rememberModelConfigOverlay(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            model: model
+        )
         MeshLog.d(
             "GROUP",
             "ConfigModelPublicationSet 成功 → 0x\(String(format: "%04X", publishAddress))"
         )
     }
 
-    /// 发送 ConfigModelSubscriptionAdd：订阅模型到组地址（直接按地址，对齐 Android）。
+    /// 发送 ConfigModelSubscriptionAdd：订阅模型到组地址。
     func addModelSubscription(
         nodeAddress: UInt16,
         elementAddress: UInt16,
@@ -753,27 +870,29 @@ final class IosMeshNetworkBridge: NSObject {
         guard let network = meshManager.meshNetwork else {
             throw MeshBridgeError.networkNotReady
         }
-        guard network.groups.contains(where: { $0.address.address == subscriptionAddress }) else {
+        guard let group = network.groups.first(where: {
+            $0.address.address == subscriptionAddress
+        }) else {
             throw MeshBridgeError.configFailed(
                 "分组 0x\(String(format: "%04X", subscriptionAddress)) 不存在，请先 createGroup"
             )
         }
-
-        let isVendor = modelId > 0xFFFF
-        let sigId = UInt16(modelId & 0xFFFF)
-        let cid: UInt16? = isVendor ? UInt16((modelId >> 16) & 0xFFFF) : nil
-        let sub = DirectConfigModelSubscriptionAdd(
-            groupAddress: subscriptionAddress,
+        guard let model = findModel(
+            nodeAddress: nodeAddress,
             elementAddress: elementAddress,
-            modelIdentifier: sigId,
-            companyIdentifier: cid
-        )
+            modelId: modelId
+        ) else {
+            throw MeshBridgeError.configFailed("未找到目标模型")
+        }
+        guard let sub = ConfigModelSubscriptionAdd(group: group, to: model) else {
+            throw MeshBridgeError.configFailed("无法构造订阅消息")
+        }
 
         MeshLog.d(
             "GROUP",
             "发送 ConfigModelSubscriptionAdd → node=0x\(String(format: "%04X", nodeAddress)) "
                 + "elem=0x\(String(format: "%04X", elementAddress)) "
-                + "model=0x\(String(format: "%04X", sigId)) "
+                + "model=0x\(String(format: "%04X", model.modelIdentifier)) "
                 + "group=0x\(String(format: "%04X", subscriptionAddress))"
         )
 
@@ -787,6 +906,12 @@ final class IosMeshNetworkBridge: NSObject {
             )
         }
         _ = meshManager.save()
+        sendEvent(["type": "networkUpdated"])
+        rememberModelConfigOverlay(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            model: model
+        )
         MeshLog.d(
             "GROUP",
             "ConfigModelSubscriptionAdd 成功 node=0x\(String(format: "%04X", nodeAddress)) "
@@ -794,7 +919,7 @@ final class IosMeshNetworkBridge: NSObject {
         )
     }
 
-    /// 发送 ConfigModelSubscriptionDelete：从组地址取消订阅（直接按地址，对齐 Android）。
+    /// 发送 ConfigModelSubscriptionDelete：从组地址取消订阅。
     func removeModelSubscription(
         nodeAddress: UInt16,
         elementAddress: UInt16,
@@ -804,22 +929,32 @@ final class IosMeshNetworkBridge: NSObject {
         guard meshManager.transmitter != nil else {
             throw MeshBridgeError.configFailed("Proxy 未连接，无法取消订阅")
         }
-
-        let isVendor = modelId > 0xFFFF
-        let sigId = UInt16(modelId & 0xFFFF)
-        let cid: UInt16? = isVendor ? UInt16((modelId >> 16) & 0xFFFF) : nil
-        let sub = DirectConfigModelSubscriptionDelete(
-            groupAddress: subscriptionAddress,
+        guard let network = meshManager.meshNetwork else {
+            throw MeshBridgeError.networkNotReady
+        }
+        guard let group = network.groups.first(where: {
+            $0.address.address == subscriptionAddress
+        }) else {
+            throw MeshBridgeError.configFailed(
+                "分组 0x\(String(format: "%04X", subscriptionAddress)) 不存在"
+            )
+        }
+        guard let model = findModel(
+            nodeAddress: nodeAddress,
             elementAddress: elementAddress,
-            modelIdentifier: sigId,
-            companyIdentifier: cid
-        )
+            modelId: modelId
+        ) else {
+            throw MeshBridgeError.configFailed("未找到目标模型")
+        }
+        guard let sub = ConfigModelSubscriptionDelete(group: group, from: model) else {
+            throw MeshBridgeError.configFailed("无法构造取消订阅消息")
+        }
 
         MeshLog.d(
             "GROUP",
             "发送 ConfigModelSubscriptionDelete → node=0x\(String(format: "%04X", nodeAddress)) "
                 + "elem=0x\(String(format: "%04X", elementAddress)) "
-                + "model=0x\(String(format: "%04X", sigId)) "
+                + "model=0x\(String(format: "%04X", model.modelIdentifier)) "
                 + "group=0x\(String(format: "%04X", subscriptionAddress))"
         )
 
@@ -833,6 +968,12 @@ final class IosMeshNetworkBridge: NSObject {
             )
         }
         _ = meshManager.save()
+        sendEvent(["type": "networkUpdated"])
+        rememberModelConfigOverlay(
+            nodeAddress: nodeAddress,
+            elementAddress: elementAddress,
+            model: model
+        )
         MeshLog.d(
             "GROUP",
             "ConfigModelSubscriptionDelete 成功 node=0x\(String(format: "%04X", nodeAddress)) "
@@ -903,9 +1044,6 @@ final class IosMeshNetworkBridge: NSObject {
     }
 
     /// 发送 Vendor 模型消息（加密）。
-    ///
-    /// Nordic 3 字节 Vendor opCode 在 UInt32 中的布局：
-    /// `opCode = (0xC0 | vendorOp) << 16 | CID_Lo << 8 | CID_Hi`
     func sendVendorMessage(
         address: UInt16,
         companyId: Int,
@@ -960,6 +1098,61 @@ final class IosMeshNetworkBridge: NSObject {
             }
     }
 
+    /// 向设备请求 Composition Data，返回设备上报的元素与模型列表。
+    func fetchReportedModels(unicastAddress: UInt16) async throws -> [String: Any?] {
+        guard meshManager.transmitter != nil else {
+            throw MeshBridgeError.configFailed("Proxy 未连接，请先 connectToProxy")
+        }
+        guard let network = meshManager.meshNetwork,
+              let node = network.node(withAddress: unicastAddress) else {
+            throw MeshBridgeError.configFailed(
+                "节点 0x\(String(format: "%04X", unicastAddress)) 不存在"
+            )
+        }
+        if let provisionerUuid = network.localProvisioner?.uuid,
+           node.uuid == provisionerUuid {
+            throw MeshBridgeError.configFailed("不能查询 Provisioner 节点")
+        }
+        guard let networkKey = primaryNetworkKey() else {
+            throw MeshBridgeError.networkNotReady
+        }
+
+        MeshLog.d(
+            "COMPOSITION",
+            "fetchReportedModels → 0x\(String(format: "%04X", unicastAddress))"
+        )
+        let response = try await sendConfigWithTimeout(
+            ConfigCompositionDataGet(),
+            to: unicastAddress,
+            using: networkKey
+        )
+        guard let compositionStatus = response as? ConfigCompositionDataStatus,
+              compositionStatus.page != nil else {
+            throw MeshBridgeError.configFailed("Composition Data 响应无效")
+        }
+
+        for attempt in 1...10 {
+            if let updated = meshManager.meshNetwork?.node(withAddress: unicastAddress),
+               !updated.elements.isEmpty {
+                let key = updated.uuid.meshHexString
+                let meshKey = normalizeKey(key)
+                let pid = peripheralIdByNodeKey[key]
+                    ?? peripheralIdByNodeKey[meshKey]
+                    ?? UserDefaults.standard.string(forKey: "ble_mesh_periph_\(meshKey)")
+                _ = meshManager.save()
+                MeshLog.d(
+                    "COMPOSITION",
+                    "设备上报模型已同步 attempt=\(attempt) "
+                        + "elements=\(updated.elements.count)"
+                )
+                return buildNodeMap(node: updated, peripheralId: pid)
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        throw MeshBridgeError.configFailed("Composition 后未同步到节点模型列表")
+    }
+
     func getNetworkInfo() -> [String: Any] {
         guard let network = meshManager.meshNetwork else { return [:] }
         let provisioner = network.localProvisioner
@@ -1007,8 +1200,26 @@ final class IosMeshNetworkBridge: NSObject {
                 "address": Int(group.address.address),
                 "name": group.name,
                 "parentAddress": group.parent.map { Int($0.address.address) },
+                "boundDeviceCount": countDevicesSubscribed(to: group.address.address),
             ] as [String: Any?]
         }
+    }
+
+    private func countDevicesSubscribed(to groupAddress: Address) -> Int {
+        guard let network = meshManager.meshNetwork else { return 0 }
+        let provisionerUuid = network.localProvisioner?.uuid
+        let meshAddress = MeshAddress(groupAddress)
+        var count = 0
+        for node in network.nodes {
+            if let provisionerUuid, node.uuid == provisionerUuid { continue }
+            let hasSubscription = node.elements.contains { element in
+                element.models.contains { model in
+                    model.isSubscribed(to: meshAddress)
+                }
+            }
+            if hasSubscription { count += 1 }
+        }
+        return count
     }
 
     func createGroup(name: String, address: UInt16) throws {
@@ -1382,15 +1593,38 @@ final class IosMeshNetworkBridge: NSObject {
             ?? meshManager.meshNetwork?.applicationKeys.first
     }
 
+    private func buildModelConfigMaps(
+        nodeAddress: UInt16,
+        element: Element
+    ) -> [[String: Any]] {
+        element.models.map { model in
+            let modelId: Int
+            if let cid = model.companyIdentifier {
+                modelId = (Int(cid) << 16) | Int(model.modelIdentifier)
+            } else {
+                modelId = Int(model.modelIdentifier)
+            }
+            let config = resolvedModelConfig(
+                nodeAddress: nodeAddress,
+                elementAddress: element.unicastAddress,
+                modelId: modelId,
+                model: model
+            )
+            return [
+                "modelId": modelId,
+                "publishAddress": config.publishAddress,
+                "subscriptionAddresses": config.subscriptionAddresses,
+            ]
+        }
+    }
+
     private func findModel(
         nodeAddress: UInt16,
         elementAddress: UInt16,
         modelId: UInt32
     ) -> Model? {
         guard let network = meshManager.meshNetwork,
-              let node = network.nodes.first(where: {
-                  $0.primaryUnicastAddress == nodeAddress
-              }),
+              let node = network.node(withAddress: nodeAddress),
               let element = node.elements.first(where: {
                   $0.unicastAddress == elementAddress
               })
@@ -1416,6 +1650,10 @@ final class IosMeshNetworkBridge: NSObject {
                     }
                     return Int(model.modelIdentifier)
                 },
+                "models": buildModelConfigMaps(
+                    nodeAddress: node.primaryUnicastAddress,
+                    element: element
+                ),
                 "location": element.location.rawValue,
             ] as [String: Any]
         }
@@ -1651,7 +1889,7 @@ private final class MeshProvisioningDelegateBridge: NSObject, ProvisioningDelega
 
 // MARK: - Vendor 原始消息
 
-/// 任意 opCode 的 Vendor 消息，用于发送自定义 Vendor 模型控制命令。
+/// Vendor 原始消息，用于发送自定义 Vendor 模型控制命令。
 private struct RawVendorMessage: UnacknowledgedVendorMessage {
     static var opCode: UInt32 { 0 }  // 实例 opCode 覆盖此值
     let opCode: UInt32

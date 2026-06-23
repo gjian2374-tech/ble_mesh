@@ -5,7 +5,7 @@
 /// 支持的模型：
 /// - Generic OnOff Server (0x1000) 通用开关
 /// - Generic Level Server (0x1002) 通用亮度
-/// - Vendor Model 0x0002 Sync 发布/订阅（0xC000）+ 设备控制（0x10 主从，0x11 播放模式）
+/// - Vendor Model 0x0002 Sync 发布/订阅（0xC000）+ 设备控制
 /// - Vendor Model 0x0001 固件存在但 Sync Pub/Sub 不使用
 library;
 
@@ -14,6 +14,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:ble_mesh/ble_mesh.dart';
+
+part 'node_control_ui.dart';
 
 void main() => runApp(const BleMeshApp());
 
@@ -260,6 +262,8 @@ class _NetworkPageState extends State<_NetworkPage> {
   MeshConnectionState _connState = MeshConnectionState.disconnected;
   MeshNetworkInfo? _networkInfo;
   bool _loadingNetworkInfo = true;
+  int _tabIndex = 0;
+  final _groupsTabKey = GlobalKey<_GroupsTabState>();
 
   late final StreamSubscription<MeshNode> _nodeAddedSub;
   late final StreamSubscription<int> _nodeDeletedSub;
@@ -274,7 +278,10 @@ class _NetworkPageState extends State<_NetworkPage> {
     _nodeAddedSub = _mesh.nodeAdded.listen(_onNodeAdded);
     _nodeDeletedSub = _mesh.nodeDeleted.listen(_onNodeDeleted);
     _connSub = _mesh.connectionState.listen(_onConnState);
-    _networkUpdatedSub = _mesh.networkUpdated.listen((_) => _loadNetworkInfo());
+    _networkUpdatedSub = _mesh.networkUpdated.listen((_) {
+      _loadNetworkInfo();
+      _loadNodes();
+    });
     _errSub = _mesh.errors.listen(
       (e) => _logDebug('[${e.code}] ${e.message}', isError: true),
     );
@@ -471,55 +478,378 @@ class _NetworkPageState extends State<_NetworkPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BLE Mesh 网络'),
+        title: Text(_tabIndex == 0 ? 'BLE Mesh 网络' : '分组'),
         actions: [
-          IconButton(
-            tooltip: '分组控制测试',
-            onPressed: _nodes.isEmpty ? null : _openGroupTest,
-            icon: const Icon(Icons.groups_outlined),
-          ),
-          IconButton(
-            tooltip: '导出网络',
-            onPressed: _exportNetwork,
-            icon: const Icon(Icons.upload_outlined),
-          ),
-          IconButton(
-            tooltip: '导入网络',
-            onPressed: _importNetwork,
-            icon: const Icon(Icons.download_outlined),
-          ),
+          if (_tabIndex == 0) ...[
+            IconButton(
+              tooltip: '分组控制测试',
+              onPressed: _nodes.isEmpty ? null : _openGroupTest,
+              icon: const Icon(Icons.groups_outlined),
+            ),
+            IconButton(
+              tooltip: '导出网络',
+              onPressed: _exportNetwork,
+              icon: const Icon(Icons.upload_outlined),
+            ),
+            IconButton(
+              tooltip: '导入网络',
+              onPressed: _importNetwork,
+              icon: const Icon(Icons.download_outlined),
+            ),
+          ],
           _ConnectionChip(state: _connState),
         ],
       ),
-      body: Column(
+      body: IndexedStack(
+        index: _tabIndex,
         children: [
-          _NetworkInfoCard(
-            info: _networkInfo,
-            loading: _loadingNetworkInfo,
-            onRefresh: _loadNetworkInfo,
+          _buildHomeTab(),
+          _GroupsTab(key: _groupsTabKey),
+        ],
+      ),
+      floatingActionButton: _tabIndex == 0
+          ? FloatingActionButton.extended(
+              onPressed: _openScan,
+              icon: const Icon(Icons.add),
+              label: const Text('添加设备'),
+            )
+          : null,
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tabIndex,
+        onDestinationSelected: (index) {
+          setState(() => _tabIndex = index);
+          if (index == 1) {
+            _groupsTabKey.currentState?.reloadGroups();
+          }
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.home_outlined),
+            selectedIcon: Icon(Icons.home),
+            label: '主页',
           ),
-          Expanded(
-            child: _nodes.isEmpty
-                ? const _EmptyNetworkView()
-                : _NodeList(
-                    nodes: _nodes,
-                    onTap: _openNodeControl,
-                    onDelete: _deleteNode,
-                  ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: _DebugInfoSection(
-              logs: _debugLogs,
-              onClear: () => setState(_debugLogs.clear),
-            ),
+          NavigationDestination(
+            icon: Icon(Icons.group_outlined),
+            selectedIcon: Icon(Icons.group),
+            label: '组',
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openScan,
-        icon: const Icon(Icons.add),
-        label: const Text('添加设备'),
+    );
+  }
+
+  Widget _buildHomeTab() {
+    return Column(
+      children: [
+        _NetworkInfoCard(
+          info: _networkInfo,
+          loading: _loadingNetworkInfo,
+          onRefresh: _loadNetworkInfo,
+        ),
+        Expanded(
+          child: _nodes.isEmpty
+              ? const _EmptyNetworkView()
+              : _NodeList(
+                  nodes: _nodes,
+                  onTap: _openNodeControl,
+                  onDelete: _deleteNode,
+                ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: _DebugInfoSection(
+            logs: _debugLogs,
+            onClear: () => setState(_debugLogs.clear),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ─── Groups Tab ───────────────────────────────────────────────────────────────
+
+/// 分组页：查看已有分组并创建新分组。
+class _GroupsTab extends StatefulWidget {
+  const _GroupsTab({super.key});
+
+  @override
+  State<_GroupsTab> createState() => _GroupsTabState();
+}
+
+class _GroupsTabState extends State<_GroupsTab> {
+  final _mesh = BleMesh();
+  final _addressController = TextEditingController();
+  List<MeshGroup> _groups = [];
+  bool _loading = true;
+  bool _creating = false;
+
+  late final StreamSubscription<void> _networkUpdatedSub;
+
+  /// 供外部 Tab 切换时主动刷新绑定设备数。
+  void reloadGroups() => _loadGroups();
+
+  @override
+  void initState() {
+    super.initState();
+    _loadGroups();
+    _networkUpdatedSub = _mesh.networkUpdated.listen((_) => _loadGroups());
+  }
+
+  @override
+  void dispose() {
+    _networkUpdatedSub.cancel();
+    _addressController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadGroups() async {
+    setState(() => _loading = true);
+    try {
+      final groups = await _mesh.getGroups();
+      if (!mounted) return;
+      setState(() {
+        _groups = groups..sort((a, b) => a.address.compareTo(b.address));
+        _loading = false;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loading = false);
+        _showMessage('加载分组失败：$e', isError: true);
+      }
+    }
+  }
+
+  int? _parseGroupAddress(String text) {
+    final hex = text.trim().toLowerCase().replaceFirst('0x', '');
+    if (hex.isEmpty) return null;
+    final addr = int.tryParse(hex, radix: 16);
+    if (addr == null || addr < 0xC000 || addr > 0xFEFF) return null;
+    return addr;
+  }
+
+  String _groupAddressLabel(int address) =>
+      '0x${address.toRadixString(16).toUpperCase().padLeft(4, '0')}';
+
+  Future<void> _createGroup() async {
+    final address = _parseGroupAddress(_addressController.text);
+    if (address == null) {
+      _showMessage('请输入有效组播地址（0xC000 - 0xFEFF）');
+      return;
+    }
+    if (_groups.any((g) => g.address == address)) {
+      _showMessage('该组播地址已存在');
+      return;
+    }
+
+    final name = _groupAddressLabel(address);
+    setState(() => _creating = true);
+    try {
+      await _mesh.createGroup(name: name, address: address);
+      _addressController.clear();
+      await _loadGroups();
+      if (mounted) _showMessage('已创建分组 $name');
+    } catch (e) {
+      _showMessage('创建失败：$e', isError: true);
+    } finally {
+      if (mounted) setState(() => _creating = false);
+    }
+  }
+
+  Future<void> _deleteGroup(MeshGroup group) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除分组'),
+        content: Text('确认删除分组 "${group.name}"（${group.hexAddress}）？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    try {
+      await _mesh.deleteGroup(group.address);
+      await _loadGroups();
+      if (mounted) _showMessage('已删除 ${group.name}');
+    } catch (e) {
+      _showMessage('删除失败：$e', isError: true);
+    }
+  }
+
+  void _showMessage(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Theme.of(context).colorScheme.error : null,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return RefreshIndicator(
+      onRefresh: _loadGroups,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    '创建新分组',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _addressController,
+                    enabled: !_creating,
+                    decoration: const InputDecoration(
+                      labelText: '组播地址',
+                      prefixText: '0x',
+                      border: OutlineInputBorder(),
+                    ),
+                    style: const TextStyle(fontFamily: 'monospace'),
+                    keyboardType: TextInputType.text,
+                    textCapitalization: TextCapitalization.characters,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(
+                        RegExp(r'[0-9a-fA-F]'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: _creating ? null : _createGroup,
+                    icon: _creating
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.add),
+                    label: Text(_creating ? '创建中…' : '创建分组'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            '已有分组',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+          const SizedBox(height: 8),
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 32),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (_groups.isEmpty)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Center(
+                  child: Text(
+                    '暂无分组，请在上方创建',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(color: cs.outline),
+                  ),
+                ),
+              ),
+            )
+          else
+            ..._groups.map(
+              (g) => _GroupListCard(
+                group: g,
+                onDelete: () => _deleteGroup(g),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GroupListCard extends StatelessWidget {
+  const _GroupListCard({
+    required this.group,
+    required this.onDelete,
+  });
+
+  final MeshGroup group;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Mesh Group',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: cs.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  // Text(
+                  //   group.name,
+                  //   style: theme.textTheme.titleMedium?.copyWith(
+                  //     fontWeight: FontWeight.w600,
+                  //   ),
+                  // ),
+                  // const SizedBox(height: 8),
+                  Text(
+                    group.hexAddress,
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '绑定设备：${group.boundDeviceCount}',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              tooltip: '删除',
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1326,1121 +1656,6 @@ class _ProvisioningFailedView extends StatelessWidget {
           label: const Text('返回重试'),
         ),
       ],
-    );
-  }
-}
-
-// ─── Node Control Page ────────────────────────────────────────────────────────
-
-/// 节点控制页：管理代理连接、AppKey 分发，并发送控制消息。
-///
-/// 对应 nRF Mesh 官方 App 的节点详情页。流程：
-/// 1. 进入页面 → （可选）自动连接 Proxy
-/// 2. Proxy 连接成功 → 自动触发 AppKey 分发
-/// 3. 分发完成 → 显示控制区域
-class _NodeControlPage extends StatefulWidget {
-  const _NodeControlPage({
-    super.key,
-    required this.node,
-    this.initialConnState = MeshConnectionState.disconnected,
-    this.autoConnectProxy = false,
-  });
-
-  final MeshNode node;
-  final MeshConnectionState initialConnState;
-
-  /// 配网后首次进入时设为 true，自动发起 Proxy 连接。
-  final bool autoConnectProxy;
-
-  @override
-  State<_NodeControlPage> createState() => _NodeControlPageState();
-}
-
-class _NodeControlPageState extends State<_NodeControlPage> {
-  final _mesh = BleMesh();
-  final List<_DebugLogEntry> _debugLogs = [];
-  late MeshConnectionState _connState;
-  bool _isDistributing = false;
-  bool _isReady = false;
-
-  StreamSubscription<MeshConnectionState>? _connSub;
-  StreamSubscription<BleMeshException>? _errSub;
-  StreamSubscription<MeshConfigurationStatus>? _configSub;
-
-  @override
-  void initState() {
-    super.initState();
-    _connState = widget.initialConnState;
-    _isReady = widget.initialConnState == MeshConnectionState.connected;
-    _connSub = _mesh.connectionState.listen(_onConnState);
-    _errSub = _mesh.errors.listen(_onError);
-    _configSub = _mesh.configurationState.listen(_onConfigState);
-    if (widget.autoConnectProxy && widget.node.hasMacAddress) {
-      // 配网完成后延迟少许，等待设备重新以 Proxy 模式广播
-      Future<void>.delayed(const Duration(seconds: 2), _connectProxy);
-    }
-  }
-
-  @override
-  void dispose() {
-    _connSub?.cancel();
-    _errSub?.cancel();
-    _configSub?.cancel();
-    super.dispose();
-  }
-
-  void _logDebug(String message, {bool isError = false}) {
-    if (!mounted) return;
-    setState(() {
-      _debugLogs.insert(
-        0,
-        _DebugLogEntry(time: DateTime.now(), message: message, isError: isError),
-      );
-      if (_debugLogs.length > 50) {
-        _debugLogs.removeRange(50, _debugLogs.length);
-      }
-    });
-  }
-
-  void _onConfigState(MeshConfigurationStatus status) {
-    if (!mounted) return;
-    final addr = status.unicastAddress;
-    final addrLabel = addr == null
-        ? ''
-        : ' → 0x${addr.toRadixString(16).padLeft(4, '0')}';
-    _logDebug(
-      '[${status.state.name}]${status.message ?? ''}$addrLabel',
-      isError: status.state == MeshConfigurationState.failed,
-    );
-    if (status.unicastAddress == widget.node.unicastAddress &&
-        status.state == MeshConfigurationState.complete) {
-      setState(() {
-        _isReady = true;
-        _isDistributing = false;
-      });
-    }
-  }
-
-  void _onConnState(MeshConnectionState state) {
-    if (!mounted) return;
-    setState(() => _connState = state);
-    // AppKey / 模型绑定由 iOS/Android 原生层在 Proxy 连接后自动触发（triggerPendingAutoConfig）。
-    // 此处不再重复调用 distributeAppKey，避免重连 Proxy 时对已配置节点二次下发导致失败。
-  }
-
-  void _onError(BleMeshException error) {
-    if (!mounted) return;
-    _logDebug('[${error.code}] ${error.message}', isError: true);
-  }
-
-  Future<void> _connectProxy() async {
-    final mac = widget.node.macAddress;
-    if (mac == null) {
-      _logDebug(
-        '未缓存设备标识，请在本机重新扫描并配网该设备后再连接',
-        isError: true,
-      );
-      return;
-    }
-    setState(() {
-      _connState = MeshConnectionState.connecting;
-      _isReady = false;
-    });
-    try {
-      await _mesh.connectToProxy(mac);
-    } catch (e) {
-      if (mounted) {
-        setState(() => _connState = MeshConnectionState.disconnected);
-        _logDebug('Proxy 连接失败：$e', isError: true);
-      }
-    }
-  }
-
-  Future<void> _disconnectProxy() async {
-    try {
-      await _mesh.disconnectFromProxy();
-      if (mounted) setState(() => _isReady = false);
-    } catch (e) {
-      _logDebug('断开失败：$e', isError: true);
-    }
-  }
-
-  Future<void> _distributeAppKey() async {
-    setState(() {
-      _isDistributing = true;
-      _isReady = false;
-    });
-    try {
-      await _mesh.distributeAppKey(widget.node.unicastAddress);
-      // 等待所有配置消息发完（包括模型绑定队列）
-      await Future<void>.delayed(const Duration(seconds: 4));
-      if (mounted) setState(() => _isReady = true);
-    } catch (e) {
-      if (mounted) _logDebug('AppKey 分发失败：$e', isError: true);
-    } finally {
-      if (mounted) setState(() => _isDistributing = false);
-    }
-  }
-
-  void _showError(String message) => _logDebug(message, isError: true);
-
-  void _showInfo(String message) => _logDebug(message);
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.node.name),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: _ProxyStatusChip(
-              state: _connState,
-              isReady: _isReady,
-            ),
-          ),
-        ],
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _NodeInfoSection(node: widget.node),
-            const SizedBox(height: 12),
-            _ProxySection(
-              connState: _connState,
-              isDistributing: _isDistributing,
-              isReady: _isReady,
-              hasMac: widget.node.hasMacAddress,
-              onConnect: _connectProxy,
-              onDisconnect: _disconnectProxy,
-              onRedistribute: _distributeAppKey,
-            ),
-            if (_isReady) ...[
-              const SizedBox(height: 12),
-              _DeviceControlPanel(
-                node: widget.node,
-                mesh: _mesh,
-                onInfo: _showInfo,
-                onError: _showError,
-              ),
-            ],
-            const SizedBox(height: 12),
-            _DebugInfoSection(
-              logs: _debugLogs,
-              onClear: () => setState(_debugLogs.clear),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Node Control Page 子组件 ───────────────────────────────────────────────────
-
-class _ProxyStatusChip extends StatelessWidget {
-  const _ProxyStatusChip({required this.state, required this.isReady});
-
-  final MeshConnectionState state;
-  final bool isReady;
-
-  @override
-  Widget build(BuildContext context) {
-    if (isReady) {
-      return const Chip(
-        avatar: Icon(Icons.check_circle, size: 16, color: Colors.green),
-        label: Text('就绪'),
-        backgroundColor: Color(0xFFE8F5E9),
-      );
-    }
-    return switch (state) {
-      MeshConnectionState.connected => const Chip(
-        avatar: Icon(Icons.bluetooth_connected, size: 16),
-        label: Text('分发密钥中…'),
-      ),
-      MeshConnectionState.connecting => const Chip(
-        avatar: SizedBox(
-          width: 14,
-          height: 14,
-          child: CircularProgressIndicator(strokeWidth: 2),
-        ),
-        label: Text('连接中…'),
-      ),
-      _ => const SizedBox.shrink(),
-    };
-  }
-}
-
-class _NodeInfoSection extends StatelessWidget {
-  const _NodeInfoSection({required this.node});
-
-  final MeshNode node;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _SectionHeader(icon: Icons.info_outline, title: '节点信息'),
-            const SizedBox(height: 12),
-            _InfoRow(label: '名称', value: node.name),
-            _InfoRow(label: '单播地址', value: node.hexAddress, mono: true),
-            if (node.macAddress != null)
-              _InfoRow(label: 'MAC 地址', value: node.macAddress!, mono: true),
-            _InfoRow(label: '元素数量', value: '${node.elementCount}'),
-            _InfoRow(label: 'AppKey 数量', value: '${node.appKeyIndexes.length}'),
-            if (node.elements.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              const Divider(height: 1),
-              const SizedBox(height: 8),
-              _SectionHeader(icon: Icons.layers_outlined, title: '元素'),
-              const SizedBox(height: 8),
-              ...node.elements.map(
-                (e) => _InfoRow(
-                  label: '元素 0x${e.elementAddress.toRadixString(16).toUpperCase().padLeft(4, '0')}',
-                  value: '${e.modelIds.length} 个模型',
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _ProxySection extends StatelessWidget {
-  const _ProxySection({
-    required this.connState,
-    required this.isDistributing,
-    required this.isReady,
-    required this.hasMac,
-    required this.onConnect,
-    required this.onDisconnect,
-    required this.onRedistribute,
-  });
-
-  final MeshConnectionState connState;
-  final bool isDistributing;
-  final bool isReady;
-  final bool hasMac;
-  final VoidCallback onConnect;
-  final VoidCallback onDisconnect;
-  final VoidCallback onRedistribute;
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _SectionHeader(icon: Icons.settings_ethernet, title: 'Proxy 代理'),
-            const SizedBox(height: 12),
-            _ProxyStatusRow(
-              connState: connState,
-              isDistributing: isDistributing,
-              isReady: isReady,
-            ),
-            const SizedBox(height: 12),
-            if (connState != MeshConnectionState.connected)
-              FilledButton.icon(
-                onPressed: hasMac &&
-                        connState != MeshConnectionState.connecting
-                    ? onConnect
-                    : null,
-                icon: const Icon(Icons.bluetooth_searching),
-                label: const Text('连接代理节点'),
-              )
-            else
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: onDisconnect,
-                      icon: const Icon(Icons.bluetooth_disabled),
-                      label: const Text('断开'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: isDistributing ? null : onRedistribute,
-                      icon: const Icon(Icons.vpn_key_outlined),
-                      label: const Text('重发密钥'),
-                    ),
-                  ),
-                ],
-              ),
-            if (!hasMac) ...[
-              const SizedBox(height: 8),
-              Text(
-                '⚠️ 未缓存 MAC 地址（应用重启后丢失），请重新配网',
-                style: TextStyle(fontSize: 12, color: cs.error),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _ProxyStatusRow extends StatelessWidget {
-  const _ProxyStatusRow({
-    required this.connState,
-    required this.isDistributing,
-    required this.isReady,
-  });
-
-  final MeshConnectionState connState;
-  final bool isDistributing;
-  final bool isReady;
-
-  @override
-  Widget build(BuildContext context) {
-    final (IconData icon, Color color, String text) = switch (true) {
-      _ when isReady => (Icons.check_circle, Colors.green, '就绪，可发送控制消息'),
-      _ when isDistributing => (
-        Icons.sync,
-        Colors.orange,
-        '正在分发 AppKey 并绑定模型…',
-      ),
-      _ when connState == MeshConnectionState.connected => (
-        Icons.bluetooth_connected,
-        Colors.blue,
-        '代理已连接，等待密钥分发',
-      ),
-      _ when connState == MeshConnectionState.connecting => (
-        Icons.more_horiz,
-        Colors.orange,
-        '正在连接代理节点…',
-      ),
-      _ => (Icons.bluetooth_disabled, Colors.grey, '未连接代理'),
-    };
-    return Row(
-      children: [
-        Icon(icon, color: color, size: 20),
-        const SizedBox(width: 8),
-        Text(text, style: TextStyle(color: color, fontSize: 13)),
-      ],
-    );
-  }
-}
-
-// ── 设备控制面板（按模型协议组织） ─────────────────────────────────────────────
-
-/// 聚合所有 SIG / Vendor 模型控制区。
-class _DeviceControlPanel extends StatelessWidget {
-  const _DeviceControlPanel({
-    required this.node,
-    required this.mesh,
-    required this.onInfo,
-    required this.onError,
-  });
-
-  final MeshNode node;
-  final BleMesh mesh;
-  final ValueChanged<String> onInfo;
-  final ValueChanged<String> onError;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _GenericOnOffSection(
-          address: node.unicastAddress,
-          mesh: mesh,
-          onInfo: onInfo,
-          onError: onError,
-        ),
-        const SizedBox(height: 12),
-        _GenericLevelSection(
-          address: node.unicastAddress,
-          mesh: mesh,
-          onInfo: onInfo,
-          onError: onError,
-        ),
-        const SizedBox(height: 12),
-        _SyncModelSection(
-          node: node,
-          mesh: mesh,
-          onInfo: onInfo,
-          onError: onError,
-        ),
-        const SizedBox(height: 12),
-        _DeviceControlModelSection(
-          address: node.unicastAddress,
-          mesh: mesh,
-          onInfo: onInfo,
-          onError: onError,
-        ),
-      ],
-    );
-  }
-}
-
-// ── Generic OnOff Server（Model 0x1000）────────────────────────────────────────
-
-class _GenericOnOffSection extends StatefulWidget {
-  const _GenericOnOffSection({
-    required this.address,
-    required this.mesh,
-    required this.onInfo,
-    required this.onError,
-  });
-
-  final int address;
-  final BleMesh mesh;
-  final ValueChanged<String> onInfo;
-  final ValueChanged<String> onError;
-
-  @override
-  State<_GenericOnOffSection> createState() => _GenericOnOffSectionState();
-}
-
-class _GenericOnOffSectionState extends State<_GenericOnOffSection> {
-  bool _isOn = false;
-  bool _isBusy = false;
-
-  Future<void> _send(bool value) async {
-    if (_isBusy) return;
-    setState(() => _isBusy = true);
-    try {
-      await widget.mesh.sendGenericOnOff(
-        address: widget.address,
-        onOff: value,
-        acknowledged: false,
-      );
-      setState(() => _isOn = value);
-      widget.onInfo(
-        'Generic OnOff → ${value ? "ON" : "OFF"} '
-        '(0x${widget.address.toRadixString(16)})',
-      );
-    } catch (e) {
-      widget.onError('Generic OnOff 失败：$e');
-    } finally {
-      if (mounted) setState(() => _isBusy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const _SectionHeader(
-              icon: Icons.toggle_on_outlined,
-              title: 'Generic OnOff Server（0x1000）',
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '通用开关模型',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.outline,
-              ),
-            ),
-            const SizedBox(height: 16),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('开关状态'),
-              subtitle: Text(_isOn ? '当前：开启' : '当前：关闭'),
-              value: _isOn,
-              onChanged: _isBusy ? null : _send,
-            ),
-            Row(
-              children: [
-                Expanded(
-                  child: _ActionButton(
-                    label: '开启',
-                    icon: Icons.lightbulb,
-                    color: Colors.orange,
-                    isActive: _isOn,
-                    isBusy: _isBusy,
-                    onPressed: () => _send(true),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _ActionButton(
-                    label: '关闭',
-                    icon: Icons.lightbulb_outline,
-                    color: Colors.blueGrey,
-                    isActive: !_isOn,
-                    isBusy: _isBusy,
-                    onPressed: () => _send(false),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Generic Level Server（Model 0x1002）────────────────────────────────────────
-
-class _GenericLevelSection extends StatefulWidget {
-  const _GenericLevelSection({
-    required this.address,
-    required this.mesh,
-    required this.onInfo,
-    required this.onError,
-  });
-
-  final int address;
-  final BleMesh mesh;
-  final ValueChanged<String> onInfo;
-  final ValueChanged<String> onError;
-
-  @override
-  State<_GenericLevelSection> createState() => _GenericLevelSectionState();
-}
-
-class _GenericLevelSectionState extends State<_GenericLevelSection> {
-  double _percent = 50;
-  Timer? _levelDebounce;
-
-  int _levelFromPercent(double percent) =>
-      (percent / 100 * 32767).round().clamp(0, 32767);
-
-  @override
-  void dispose() {
-    _levelDebounce?.cancel();
-    super.dispose();
-  }
-
-  Future<void> _sendLevel(int level) async {
-    try {
-      await widget.mesh.sendGenericLevel(
-        address: widget.address,
-        level: level,
-        acknowledged: false,
-      );
-      widget.onInfo('Generic Level → $level (${_percent.round()}%)');
-    } catch (e) {
-      widget.onError('Generic Level 失败：$e');
-    }
-  }
-
-  void _onPercentChanged(double percent) {
-    setState(() => _percent = percent);
-    _levelDebounce?.cancel();
-    _levelDebounce = Timer(const Duration(milliseconds: 120), () {
-      _sendLevel(_levelFromPercent(percent));
-    });
-  }
-
-  void _onPercentChangeEnd(double percent) {
-    _levelDebounce?.cancel();
-    _sendLevel(_levelFromPercent(percent));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final level = _levelFromPercent(_percent);
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const _SectionHeader(
-              icon: Icons.tune,
-              title: 'Generic Level Server（0x1002）',
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '拖动滑块实时发送亮度（Level 0 ~ 32767）',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.outline,
-              ),
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: Slider(
-                    value: _percent,
-                    min: 0,
-                    max: 100,
-                    label: '${_percent.round()}%',
-                    onChanged: _onPercentChanged,
-                    onChangeEnd: _onPercentChangeEnd,
-                  ),
-                ),
-                SizedBox(
-                  width: 72,
-                  child: Text(
-                    '$level\n${_percent.round()}%',
-                    textAlign: TextAlign.right,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Sync Group（Vendor 0x0002 发布/订阅，与固件 send_ble_mesh_sync_mode 一致）──
-
-class _SyncModelSection extends StatefulWidget {
-  const _SyncModelSection({
-    required this.node,
-    required this.mesh,
-    required this.onInfo,
-    required this.onError,
-  });
-
-  final MeshNode node;
-  final BleMesh mesh;
-  final ValueChanged<String> onInfo;
-  final ValueChanged<String> onError;
-
-  @override
-  State<_SyncModelSection> createState() => _SyncModelSectionState();
-}
-
-class _SyncModelSectionState extends State<_SyncModelSection> {
-  int _syncGroupAddress = kDefaultSyncGroupAddress;
-  bool _isBusy = false;
-  bool _syncModel0001 = true;
-  bool _syncModel0002 = true;
-  bool _syncSubscribe = false;
-  bool _syncPublish = false;
-
-  int get _elementAddress =>
-      widget.node.primaryElement?.elementAddress ?? widget.node.unicastAddress;
-
-  List<int> get _selectedSyncModelIds {
-    final ids = <int>[];
-    if (_syncModel0001) ids.add(kSyncModelCompoundId);
-    if (_syncModel0002) ids.add(kDeviceControlModelCompoundId);
-    return ids;
-  }
-
-  MeshModelMessagingMode _resolveSyncMode() {
-    if (!_syncSubscribe && !_syncPublish) {
-      return MeshModelMessagingMode.appKeyOnly;
-    }
-    if (_syncSubscribe && _syncPublish) {
-      return MeshModelMessagingMode.subscribeAndPublish;
-    }
-    if (_syncSubscribe) return MeshModelMessagingMode.subscribeOnly;
-    return MeshModelMessagingMode.publishOnly;
-  }
-
-  Future<void> _ensureSyncGroup() async {
-    try {
-      await widget.mesh.createGroup(
-        name: 'Sync Group',
-        address: _syncGroupAddress,
-      );
-    } catch (_) {
-      // 组已存在时忽略
-    }
-  }
-
-  Future<void> _applySyncConfiguration({MeshModelMessagingMode? mode}) async {
-    if (_isBusy) return;
-    final modelIds = _selectedSyncModelIds;
-    if (modelIds.isEmpty) {
-      widget.onError('请至少选择一个 Vendor 模型（0x0001 或 0x0002）');
-      return;
-    }
-    final resolvedMode = mode ?? _resolveSyncMode();
-    setState(() => _isBusy = true);
-    try {
-      if (resolvedMode.requiresGroupAddress) {
-        await _ensureSyncGroup();
-      }
-      await widget.mesh.configureSyncModels(
-        nodeAddress: widget.node.unicastAddress,
-        mode: resolvedMode,
-        modelIds: modelIds,
-        syncGroupAddress: _syncGroupAddress,
-        elementAddress: _elementAddress,
-      );
-      final modelLabel = modelIds
-          .map((id) => '0x${(id & 0xFFFF).toRadixString(16).padLeft(4, '0')}')
-          .join('、');
-      final modeLabel = switch (resolvedMode) {
-        MeshModelMessagingMode.appKeyOnly => '仅 Bind AppKey',
-        MeshModelMessagingMode.subscribeOnly => '订阅',
-        MeshModelMessagingMode.publishOnly => '发布',
-        MeshModelMessagingMode.subscribeAndPublish => '订阅+发布',
-      };
-      final groupLabel = resolvedMode.requiresGroupAddress
-          ? ' → 0x${_syncGroupAddress.toRadixString(16).toUpperCase()}'
-          : '';
-      widget.onInfo('Sync 已配置：$modelLabel，$modeLabel$groupLabel');
-    } catch (e) {
-      widget.onError('Sync 配置失败：$e');
-    } finally {
-      if (mounted) setState(() => _isBusy = false);
-    }
-  }
-
-  Future<void> _configureAsMaster() => _applySyncConfiguration(
-        mode: MeshModelMessagingMode.publishOnly,
-      );
-
-  Future<void> _configureAsSlave() => _applySyncConfiguration(
-        mode: MeshModelMessagingMode.subscribeOnly,
-      );
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const _SectionHeader(
-              icon: Icons.sync,
-              title: 'Sync Group（Vendor 0x0001 / 0x0002）',
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '可选模型与订阅/发布；均不选时仅下发 AppKey Bind',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.outline,
-              ),
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 4,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                FilterChip(
-                  label: const Text('0x0001'),
-                  selected: _syncModel0001,
-                  onSelected: _isBusy
-                      ? null
-                      : (v) => setState(() => _syncModel0001 = v),
-                ),
-                FilterChip(
-                  label: const Text('0x0002'),
-                  selected: _syncModel0002,
-                  onSelected: _isBusy
-                      ? null
-                      : (v) => setState(() => _syncModel0002 = v),
-                ),
-                FilterChip(
-                  label: const Text('订阅'),
-                  selected: _syncSubscribe,
-                  onSelected: _isBusy
-                      ? null
-                      : (v) => setState(() => _syncSubscribe = v),
-                ),
-                FilterChip(
-                  label: const Text('发布'),
-                  selected: _syncPublish,
-                  onSelected: _isBusy
-                      ? null
-                      : (v) => setState(() => _syncPublish = v),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                const Text('Sync Group：'),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: DropdownButton<int>(
-                    isExpanded: true,
-                    value: _syncGroupAddress,
-                    items: const [
-                      DropdownMenuItem(
-                        value: 0xC000,
-                        child: Text('0xC000（默认）'),
-                      ),
-                      DropdownMenuItem(
-                        value: 0xC001,
-                        child: Text('0xC001'),
-                      ),
-                      DropdownMenuItem(
-                        value: 0xC002,
-                        child: Text('0xC002'),
-                      ),
-                    ],
-                    onChanged: _isBusy
-                        ? null
-                        : (v) {
-                            if (v != null) setState(() => _syncGroupAddress = v);
-                          },
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: _isBusy ? null : () => _applySyncConfiguration(),
-                icon: const Icon(Icons.tune),
-                label: const Text('应用 Sync 配置'),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _isBusy ? null : _configureAsMaster,
-                    icon: const Icon(Icons.upload),
-                    label: const Text('快捷：主机（发布）'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _isBusy ? null : _configureAsSlave,
-                    icon: const Icon(Icons.download),
-                    label: const Text('快捷：从机（订阅）'),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Vendor Model 0x0002 设备控制模型 ───────────────────────────────────────────
-
-class _DeviceControlModelSection extends StatefulWidget {
-  const _DeviceControlModelSection({
-    required this.address,
-    required this.mesh,
-    required this.onInfo,
-    required this.onError,
-  });
-
-  final int address;
-  final BleMesh mesh;
-  final ValueChanged<String> onInfo;
-  final ValueChanged<String> onError;
-
-  @override
-  State<_DeviceControlModelSection> createState() =>
-      _DeviceControlModelSectionState();
-}
-
-class _DeviceControlModelSectionState extends State<_DeviceControlModelSection> {
-  MeshNodeRole _role = MeshNodeRole.slave;
-  SourceType _sourceType = SourceType.sdCard;
-  int _modeIndex = 1;
-  double _speed = 5;
-  double _brightness = 32768;
-  bool _isBusy = false;
-
-  Future<void> _setRole(MeshNodeRole role) async {
-    if (_isBusy) return;
-    setState(() => _isBusy = true);
-    try {
-      await widget.mesh.setMasterSlaveRole(
-        address: widget.address,
-        role: role,
-      );
-      setState(() => _role = role);
-      widget.onInfo(
-        'OpCode 0x10 → ${role == MeshNodeRole.master ? "主机(0x01)" : "从机(0x02)"}',
-      );
-    } catch (e) {
-      widget.onError('主从切换失败：$e');
-    } finally {
-      if (mounted) setState(() => _isBusy = false);
-    }
-  }
-
-  Future<void> _sendPlayMode() async {
-    if (_isBusy) return;
-    setState(() => _isBusy = true);
-    try {
-      final config = PlayModeConfig(
-        sourceType: _sourceType,
-        modeIndex: _modeIndex,
-        speed: _speed.round(),
-        brightness: _brightness.round(),
-      );
-      await widget.mesh.setPlayMode(
-        address: widget.address,
-        config: config,
-      );
-      widget.onInfo(
-        'OpCode 0x11 → ${config.toString()} '
-        'payload=${config.toBytes().map((b) => b.toRadixString(16).padLeft(2, "0")).join(" ")}',
-      );
-    } catch (e) {
-      widget.onError('播放模式失败：$e');
-    } finally {
-      if (mounted) setState(() => _isBusy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const _SectionHeader(
-              icon: Icons.extension_outlined,
-              title: 'Vendor Model 0x0002（设备控制）',
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'CID 0x02E5',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: cs.outline,
-              ),
-            ),
-
-            // OpCode 0x10
-            const SizedBox(height: 16),
-            const _SectionHeader(
-              icon: Icons.swap_horiz,
-              title: 'OpCode 0x10 — 主从机切换',
-            ),
-            const SizedBox(height: 8),
-            SegmentedButton<MeshNodeRole>(
-              segments: const [
-                ButtonSegment(
-                  value: MeshNodeRole.master,
-                  label: Text('主机 0x01'),
-                  icon: Icon(Icons.star),
-                ),
-                ButtonSegment(
-                  value: MeshNodeRole.slave,
-                  label: Text('从机 0x02'),
-                  icon: Icon(Icons.star_border),
-                ),
-              ],
-              selected: {_role},
-              onSelectionChanged: _isBusy
-                  ? null
-                  : (roles) => _setRole(roles.first),
-            ),
-
-            // OpCode 0x11
-            const SizedBox(height: 20),
-            const _SectionHeader(
-              icon: Icons.play_circle_outline,
-              title: 'OpCode 0x11 — 播放模式切换',
-            ),
-            const SizedBox(height: 8),
-            InputDecorator(
-              decoration: const InputDecoration(
-                labelText: '资源类型 (byte0)',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<SourceType>(
-                  isExpanded: true,
-                  value: _sourceType,
-                  items: const [
-                DropdownMenuItem(
-                  value: SourceType.sdCard,
-                  child: Text('0x01 SD 卡资源'),
-                ),
-                DropdownMenuItem(
-                  value: SourceType.algorithm,
-                  child: Text('0x02 算法资源'),
-                ),
-              ],
-              onChanged: _isBusy
-                  ? null
-                  : (v) {
-                      if (v != null) setState(() => _sourceType = v);
-                    },
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Text('模式 index (byte1)'),
-                const Spacer(),
-                IconButton(
-                  onPressed: _isBusy || _modeIndex <= 0
-                      ? null
-                      : () => setState(() => _modeIndex--),
-                  icon: const Icon(Icons.remove_circle_outline),
-                ),
-                Text('$_modeIndex'),
-                IconButton(
-                  onPressed: _isBusy || _modeIndex >= 255
-                      ? null
-                      : () => setState(() => _modeIndex++),
-                  icon: const Icon(Icons.add_circle_outline),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text('速度 (byte2)：${_speed.round()} / 10'),
-            Slider(
-              value: _speed,
-              min: 1,
-              max: 10,
-              divisions: 9,
-              label: '${_speed.round()}',
-              onChanged: _isBusy ? null : (v) => setState(() => _speed = v),
-            ),
-            Text(
-              '亮度 (byte3~4)：${_brightness.round()} / 65535',
-            ),
-            Slider(
-              value: _brightness,
-              min: 0,
-              max: 65535,
-              divisions: 100,
-              label: '${_brightness.round()}',
-              onChanged: _isBusy ? null : (v) => setState(() => _brightness = v),
-            ),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: _isBusy ? null : _sendPlayMode,
-                icon: _isBusy
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.send),
-                label: const Text('发送播放模式'),
-              ),
-            ),
-          ],
-        ),
-      ),
     );
   }
 }

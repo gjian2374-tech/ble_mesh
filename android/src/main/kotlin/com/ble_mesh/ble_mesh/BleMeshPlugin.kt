@@ -199,6 +199,12 @@ class BleMeshPlugin :
             // ── 节点管理 ──────────────────────────────────────────────────────
             "getNodes" -> handleGetNodes(result)
 
+            "fetchReportedModels" -> {
+                val unicastAddress = call.argument<Int>("unicastAddress")
+                    ?: return result.error("INVALID_ARGUMENT", "缺少 unicastAddress 参数", null)
+                handleFetchReportedModels(unicastAddress, result)
+            }
+
             "deleteNode" -> {
                 val unicastAddress = call.argument<Int>("unicastAddress")
                     ?: return result.error("INVALID_ARGUMENT", "缺少 unicastAddress 参数", null)
@@ -275,6 +281,37 @@ class BleMeshPlugin :
                     nodeAddress, elementAddress, modelId,
                     publishAddress, appKeyIndex, publishTtl, publishPeriod, result
                 )
+            }
+
+            // ── 自定义 BLE 通道 ───────────────────────────────────────────────
+            "configureCustomBleChannel" -> {
+                val serviceUuid = call.argument<String>("serviceUuid")
+                    ?: return result.error("INVALID_ARGUMENT", "缺少 serviceUuid", null)
+                val writeUuid = call.argument<String>("writeCharacteristicUuid")
+                    ?: return result.error(
+                        "INVALID_ARGUMENT",
+                        "缺少 writeCharacteristicUuid",
+                        null,
+                    )
+                val notifyUuid = call.argument<String>("notifyCharacteristicUuid")
+                gattManager?.configureCustomChannel(serviceUuid, writeUuid, notifyUuid)
+                result.success(null)
+            }
+
+            "isCustomBleReady" -> {
+                result.success(gattManager?.isCustomChannelReady() == true)
+            }
+
+            "writeCustomBleData" -> {
+                val data = byteArrayFromCall(call, "data")
+                gattManager?.writeCustomData(data)
+                result.success(null)
+            }
+
+            "transferCustomBleData" -> {
+                val data = byteArrayFromCall(call, "data")
+                gattManager?.transferCustomData(data)
+                result.success(null)
             }
 
             else -> result.notImplemented()
@@ -467,6 +504,23 @@ class BleMeshPlugin :
         result.success(manager.getNodes())
     }
 
+    private suspend fun handleFetchReportedModels(unicastAddress: Int, result: Result) {
+        val manager = networkManager
+            ?: return result.error("NOT_INITIALIZED", "请先调用 initialize()", null)
+        try {
+            result.success(manager.fetchReportedModels(unicastAddress))
+        } catch (e: IllegalArgumentException) {
+            result.error("NODE_NOT_FOUND", e.message, null)
+        } catch (e: IllegalStateException) {
+            val code = if (e.message?.contains("Proxy") == true) {
+                "NOT_CONNECTED"
+            } else {
+                "COMPOSITION_FAILED"
+            }
+            result.error(code, e.message, null)
+        }
+    }
+
     private suspend fun handleDeleteNode(unicastAddress: Int, result: Result) {
         val manager = networkManager
             ?: return result.error("NOT_INITIALIZED", "请先调用 initialize()", null)
@@ -550,5 +604,24 @@ class BleMeshPlugin :
             publishAddress, appKeyIndex, publishTtl, publishPeriod
         )
         result.success(null)
+    }
+
+    /**
+     * 从 MethodCall 解析二进制参数。
+     *
+     * Flutter 的 [Uint8List] 在 Android 侧为 [ByteArray]，
+     * 若用 [MethodCall.argument] 强转为 List 会触发 ClassCastException。
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun byteArrayFromCall(call: MethodCall, key: String): ByteArray {
+        val args = call.arguments as? Map<String, Any?> ?: return ByteArray(0)
+        return when (val raw = args[key]) {
+            null -> ByteArray(0)
+            is ByteArray -> raw
+            is List<*> -> ByteArray(raw.size) { index ->
+                (raw[index] as Number).toInt().toByte()
+            }
+            else -> ByteArray(0)
+        }
     }
 }

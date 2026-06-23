@@ -5,4 +5,4 @@
 * Proxy connection, unicast control (Generic On/Off, Generic Level).
 * Group management, multicast control, and sync group configuration.
 * Node deletion, network import/export (nRF Mesh App compatible JSON).
-* Espressif vendor message support (master/slave role, play mode).
+* Espressif vendor messaging via `sendVendorMessage()`.

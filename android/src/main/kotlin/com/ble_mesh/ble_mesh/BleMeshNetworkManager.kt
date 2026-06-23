@@ -28,8 +28,12 @@ import no.nordicsemi.android.mesh.transport.ConfigModelAppBind
 import no.nordicsemi.android.mesh.transport.ConfigModelAppStatus
 import no.nordicsemi.android.mesh.transport.ConfigModelAppUnbind
 import no.nordicsemi.android.mesh.transport.ConfigModelPublicationSet
+import no.nordicsemi.android.mesh.transport.ConfigModelPublicationStatus
+import no.nordicsemi.android.mesh.transport.PublicationSettings
 import no.nordicsemi.android.mesh.transport.ConfigModelSubscriptionAdd
 import no.nordicsemi.android.mesh.transport.ConfigModelSubscriptionDelete
+import no.nordicsemi.android.mesh.transport.ConfigModelSubscriptionStatus
+import no.nordicsemi.android.mesh.transport.MeshModel
 import no.nordicsemi.android.mesh.transport.ConfigNodeReset
 import no.nordicsemi.android.mesh.transport.ControlMessage
 import no.nordicsemi.android.mesh.transport.Element
@@ -139,6 +143,64 @@ class BleMeshNetworkManager(
      */
     private val nodeAddressCache = mutableMapOf<String, String>()
 
+    /**
+     * 模型发布/订阅 overlay：Composition 同步可能清空 Nordic DB 中的配置，
+     * overlay 保留用户已下发的订阅/发布地址供 getNodes 返回。
+     */
+    private data class ModelConfigOverlay(
+        val publishAddress: Int = 0,
+        val subscriptionAddresses: List<Int> = emptyList(),
+    )
+
+    private val modelConfigOverlay = mutableMapOf<String, ModelConfigOverlay>()
+
+    private fun modelOverlayKey(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+    ): String = "$nodeAddress:$elementAddress:$modelId"
+
+    private fun rememberModelConfigOverlay(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        publishAddress: Int? = null,
+        subscriptionAddresses: List<Int>? = null,
+    ) {
+        val key = modelOverlayKey(nodeAddress, elementAddress, modelId)
+        val existing = modelConfigOverlay[key] ?: ModelConfigOverlay()
+        modelConfigOverlay[key] = existing.copy(
+            publishAddress = publishAddress ?: existing.publishAddress,
+            subscriptionAddresses = subscriptionAddresses ?: existing.subscriptionAddresses,
+        )
+    }
+
+    private fun resolvedModelConfig(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        model: MeshModel,
+    ): ModelConfigOverlay {
+        val fromModel = ModelConfigOverlay(
+            publishAddress = model.publicationSettings?.publishAddress ?: 0,
+            subscriptionAddresses = model.subscribedAddresses,
+        )
+        val key = modelOverlayKey(nodeAddress, elementAddress, modelId)
+        val overlay = modelConfigOverlay[key]
+        if (overlay == null) {
+            if (fromModel.publishAddress != 0 || fromModel.subscriptionAddresses.isNotEmpty()) {
+                modelConfigOverlay[key] = fromModel
+            }
+            return fromModel
+        }
+        return ModelConfigOverlay(
+            publishAddress = overlay.publishAddress.takeIf { it != 0 }
+                ?: fromModel.publishAddress,
+            subscriptionAddresses = overlay.subscriptionAddresses.takeIf { it.isNotEmpty() }
+                ?: fromModel.subscriptionAddresses,
+        )
+    }
+
     /** TID 计数器（Transaction Identifier，0x00-0xFF 循环）。 */
     private val tidCounter = AtomicInteger(0)
 
@@ -158,6 +220,10 @@ class BleMeshNetworkManager(
         mutableMapOf<Int, CompletableDeferred<ConfigAppKeyStatus>>()
     private val pendingModelBindRequests =
         mutableMapOf<String, CompletableDeferred<ConfigModelAppStatus>>()
+    private val pendingSubscriptionRequests =
+        mutableMapOf<String, CompletableDeferred<ConfigModelSubscriptionStatus>>()
+    private val pendingPublicationRequests =
+        mutableMapOf<String, CompletableDeferred<ConfigModelPublicationStatus>>()
 
     private var isRepairingMeshNetwork = false
 
@@ -679,6 +745,30 @@ class BleMeshNetworkManager(
     fun isProxyReady(address: String): Boolean =
         gattManager?.isReadyForProxy(address) ?: false
 
+    /**
+     * 向设备发送 Config Composition Data Get，返回设备上报的元素与模型列表。
+     *
+     * 需要 Proxy 已连接。返回的 `elements` 来自本次 Composition 响应。
+     */
+    suspend fun fetchReportedModels(unicastAddress: Int): Map<String, Any?> {
+        val gatt = gattManager
+            ?: throw IllegalStateException("BleGattManager 未初始化")
+        if (!gatt.isConnected) {
+            throw IllegalStateException("Proxy 未连接，请先 connectToProxy")
+        }
+
+        val network = meshManagerApi.meshNetwork
+            ?: throw IllegalStateException("Mesh 网络未就绪")
+        val meshNode = network.nodes.firstOrNull { it.unicastAddress == unicastAddress }
+            ?: throw IllegalArgumentException("节点 0x${unicastAddress.toString(16)} 不存在")
+        if (isProvisionerNode(network, meshNode)) {
+            throw IllegalArgumentException("不能查询 Provisioner 节点")
+        }
+
+        val status = fetchCompositionData(meshNode)
+        return buildNodeMap(meshNode)
+    }
+
     /** 返回 nRF Mesh App 首页风格的网络摘要信息。 */
     fun getNetworkInfo(): Map<String, Any?> {
         val network = meshManagerApi.meshNetwork ?: return emptyMap()
@@ -816,14 +906,30 @@ class BleMeshNetworkManager(
 
     // ── 分组管理 ───────────────────────────────────────────────────────────────
 
+    /** 统计订阅了指定组播地址的设备（节点）数量。 */
+    private fun countDevicesSubscribedToGroup(groupAddress: Int): Int {
+        val network = meshManagerApi.meshNetwork ?: return 0
+        return network.nodes
+            .asSequence()
+            .filterNot { isProvisionerNode(network, it) }
+            .count { node ->
+                node.elements?.values?.any { element ->
+                    element.meshModels?.values?.any { model ->
+                        model.subscribedAddresses.contains(groupAddress)
+                    } == true
+                } == true
+            }
+    }
+
     /** 获取所有已定义分组。 */
     fun getGroups(): List<Map<String, Any?>> =
         meshManagerApi.meshNetwork?.groups?.map { group ->
             mapOf(
                 "address" to group.address,
                 "name" to group.name,
-            "parentAddress" to null,
-        )
+                "parentAddress" to null,
+                "boundDeviceCount" to countDevicesSubscribedToGroup(group.address),
+            )
         } ?: emptyList()
 
     /** 在 Mesh 网络中创建新分组（仅本地存储，无需发送 Mesh 消息）。 */
@@ -853,11 +959,27 @@ class BleMeshNetworkManager(
         modelId: Int,
         subscriptionAddress: Int,
     ) {
-        val msg = ConfigModelSubscriptionAdd(elementAddress, subscriptionAddress, modelId)
-        sendConfigMessage(nodeAddress, msg)
+        val status = sendSubscriptionConfigAndAwaitStatus(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            subscriptionAddress = subscriptionAddress,
+            message = ConfigModelSubscriptionAdd(elementAddress, subscriptionAddress, modelId),
+            actionLabel = "订阅添加",
+        )
+        if (!status.isSuccessful) {
+            throw IllegalStateException("订阅添加失败: status=0x${status.statusCode.toString(16)}")
+        }
+        applyLocalSubscription(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            subscriptionAddress = subscriptionAddress,
+            add = true,
+        )
         Log.d(
             TAG,
-            "订阅添加: node=0x${nodeAddress.toString(16)} " +
+            "订阅添加成功: node=0x${nodeAddress.toString(16)} " +
                 "model=0x${modelId.toString(16)} → 0x${subscriptionAddress.toString(16)}",
         )
         MeshEventStreamHandler.sendEvent(mapOf("type" to "networkUpdated"))
@@ -872,11 +994,27 @@ class BleMeshNetworkManager(
         modelId: Int,
         subscriptionAddress: Int,
     ) {
-        val msg = ConfigModelSubscriptionDelete(elementAddress, subscriptionAddress, modelId)
-        sendConfigMessage(nodeAddress, msg)
+        val status = sendSubscriptionConfigAndAwaitStatus(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            subscriptionAddress = subscriptionAddress,
+            message = ConfigModelSubscriptionDelete(elementAddress, subscriptionAddress, modelId),
+            actionLabel = "订阅删除",
+        )
+        if (!status.isSuccessful) {
+            throw IllegalStateException("订阅删除失败: status=0x${status.statusCode.toString(16)}")
+        }
+        applyLocalSubscription(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            subscriptionAddress = subscriptionAddress,
+            add = false,
+        )
         Log.d(
             TAG,
-            "订阅删除: node=0x${nodeAddress.toString(16)} model=0x${modelId.toString(16)}",
+            "订阅删除成功: node=0x${nodeAddress.toString(16)} model=0x${modelId.toString(16)}",
         )
         MeshEventStreamHandler.sendEvent(mapOf("type" to "networkUpdated"))
     }
@@ -975,7 +1113,7 @@ class BleMeshNetworkManager(
     }
 
     /**
-     * 发送 Vendor Model 消息（操作码按 BLE Mesh Vendor OpCode 格式，3 字节）。
+     * 发送 Vendor Model 消息。
      *
      * 注意：nRF Mesh Library 3.3.x 仅提供 [VendorModelMessageAcked]，
      * `acknowledged` 参数保留接口兼容性，当前两种情况均发送 Acked 消息。
@@ -1039,22 +1177,32 @@ class BleMeshNetworkManager(
         publishTtl: Int,
         publishPeriod: Int,
     ) {
-        val msg = ConfigModelPublicationSet(
-            elementAddress,
-            publishAddress,
-            appKeyIndex,
-            false,          // credential flag（false = master security material）
-            publishTtl,
-            publishPeriod,  // publication steps
-            0,              // publication resolution（0 = 100ms/步）
-            0,              // retransmit count
-            0,              // retransmit interval steps
-            modelId,
+        val status = sendPublicationConfigAndAwaitStatus(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            publishAddress = publishAddress,
+            appKeyIndex = appKeyIndex,
+            publishTtl = publishTtl,
+            publishPeriod = publishPeriod,
         )
-        sendConfigMessage(nodeAddress, msg)
+        if (!status.isSuccessful) {
+            throw IllegalStateException(
+                "Publication Set 失败: status=0x${status.statusCode.toString(16)}",
+            )
+        }
+        applyLocalPublication(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            publishAddress = publishAddress,
+            appKeyIndex = appKeyIndex,
+            publishTtl = publishTtl,
+            publishPeriod = publishPeriod,
+        )
         Log.d(
             TAG,
-            "Publication Set: node=0x${nodeAddress.toString(16)} → 0x${publishAddress.toString(16)}",
+            "Publication Set 成功: node=0x${nodeAddress.toString(16)} → 0x${publishAddress.toString(16)}",
         )
         MeshEventStreamHandler.sendEvent(mapOf("type" to "networkUpdated"))
     }
@@ -1275,6 +1423,163 @@ class BleMeshNetworkManager(
         modelIdentifier: Int,
     ): String = "$sourceAddress:$elementAddress:$modelIdentifier"
 
+    private fun subscriptionRequestKey(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        subscriptionAddress: Int,
+    ): String = "$nodeAddress:$elementAddress:$modelId:$subscriptionAddress"
+
+    private suspend fun sendSubscriptionConfigAndAwaitStatus(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        subscriptionAddress: Int,
+        message: MeshMessage,
+        actionLabel: String,
+    ): ConfigModelSubscriptionStatus {
+        val requestKey = subscriptionRequestKey(
+            nodeAddress,
+            elementAddress,
+            modelId,
+            subscriptionAddress,
+        )
+        val deferred = CompletableDeferred<ConfigModelSubscriptionStatus>()
+        pendingSubscriptionRequests[requestKey] = deferred
+        sendConfigMessage(nodeAddress, message)
+        return try {
+            withTimeout(CONFIG_TIMEOUT_MS) { deferred.await() }
+        } catch (e: TimeoutCancellationException) {
+            throw IllegalStateException("$actionLabel 超时")
+        } finally {
+            pendingSubscriptionRequests.remove(requestKey)
+        }
+    }
+
+    /** 同步本地网络数据库中的模型订阅列表（Direct Config 不会自动更新）。 */
+    private fun applyLocalSubscription(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        subscriptionAddress: Int,
+        add: Boolean,
+    ) {
+        val network = meshManagerApi.meshNetwork ?: return
+        val node = network.getNode(nodeAddress) ?: return
+        val element = node.elements?.get(elementAddress) ?: return
+        val model = element.meshModels?.get(modelId)
+            ?: element.meshModels?.values?.firstOrNull { it.modelId == modelId }
+            ?: return
+
+        try {
+            if (add) {
+                if (model.subscribedAddresses.contains(subscriptionAddress)) {
+                    return
+                }
+                val method = MeshModel::class.java.getDeclaredMethod(
+                    "addSubscriptionAddress",
+                    Int::class.javaPrimitiveType,
+                )
+                method.isAccessible = true
+                method.invoke(model, subscriptionAddress)
+            } else {
+                val method = MeshModel::class.java.getDeclaredMethod(
+                    "removeSubscriptionAddress",
+                    Integer::class.java,
+                )
+                method.isAccessible = true
+                method.invoke(model, subscriptionAddress)
+            }
+            network.setTimestamp(System.currentTimeMillis())
+            rememberModelConfigOverlay(
+                nodeAddress = nodeAddress,
+                elementAddress = elementAddress,
+                modelId = modelId,
+                subscriptionAddresses = model.subscribedAddresses,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "更新本地订阅缓存失败: ${e.message}")
+        }
+    }
+
+    private fun publicationRequestKey(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+    ): String = "$nodeAddress:$elementAddress:$modelId:publication"
+
+    private suspend fun sendPublicationConfigAndAwaitStatus(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        publishAddress: Int,
+        appKeyIndex: Int,
+        publishTtl: Int,
+        publishPeriod: Int,
+    ): ConfigModelPublicationStatus {
+        val requestKey = publicationRequestKey(nodeAddress, elementAddress, modelId)
+        val deferred = CompletableDeferred<ConfigModelPublicationStatus>()
+        pendingPublicationRequests[requestKey] = deferred
+        val msg = ConfigModelPublicationSet(
+            elementAddress,
+            publishAddress,
+            appKeyIndex,
+            false,
+            publishTtl,
+            publishPeriod,
+            0,
+            0,
+            0,
+            modelId,
+        )
+        sendConfigMessage(nodeAddress, msg)
+        return try {
+            withTimeout(CONFIG_TIMEOUT_MS) { deferred.await() }
+        } catch (e: TimeoutCancellationException) {
+            throw IllegalStateException("Publication Set 超时")
+        } finally {
+            pendingPublicationRequests.remove(requestKey)
+        }
+    }
+
+    private fun applyLocalPublication(
+        nodeAddress: Int,
+        elementAddress: Int,
+        modelId: Int,
+        publishAddress: Int,
+        appKeyIndex: Int,
+        publishTtl: Int,
+        publishPeriod: Int,
+    ) {
+        val network = meshManagerApi.meshNetwork ?: return
+        val node = network.getNode(nodeAddress) ?: return
+        val element = node.elements?.get(elementAddress) ?: return
+        val model = element.meshModels?.get(modelId)
+            ?: element.meshModels?.values?.firstOrNull { it.modelId == modelId }
+            ?: return
+
+        if (publishAddress == 0) {
+            model.setPublicationSettings(null)
+        } else {
+            model.setPublicationSettings(
+                PublicationSettings(
+                    publishAddress,
+                    appKeyIndex,
+                    false,
+                    publishTtl,
+                    publishPeriod,
+                ),
+            )
+        }
+        network.setTimestamp(System.currentTimeMillis())
+        rememberModelConfigOverlay(
+            nodeAddress = nodeAddress,
+            elementAddress = elementAddress,
+            modelId = modelId,
+            publishAddress = publishAddress,
+        )
+    }
+
     private fun handleConfigStatusMessage(src: Int, message: MeshMessage) {
         when (message) {
             is ConfigCompositionDataStatus -> {
@@ -1293,6 +1598,25 @@ class BleMeshNetworkManager(
                 )
                 pendingModelBindRequests.remove(key)?.complete(message)
             }
+
+            is ConfigModelSubscriptionStatus -> {
+                val key = subscriptionRequestKey(
+                    src,
+                    message.elementAddress,
+                    message.modelIdentifier,
+                    message.subscriptionAddress,
+                )
+                pendingSubscriptionRequests.remove(key)?.complete(message)
+            }
+
+            is ConfigModelPublicationStatus -> {
+                val key = publicationRequestKey(
+                    src,
+                    message.elementAddress,
+                    message.modelIdentifier,
+                )
+                pendingPublicationRequests.remove(key)?.complete(message)
+            }
         }
     }
 
@@ -1304,9 +1628,21 @@ class BleMeshNetworkManager(
             IllegalStateException(reason),
         )
         val prefix = "$nodeAddress:"
-        val keys = pendingModelBindRequests.keys.filter { it.startsWith(prefix) }
-        keys.forEach { key ->
+        val bindKeys = pendingModelBindRequests.keys.filter { it.startsWith(prefix) }
+        bindKeys.forEach { key ->
             pendingModelBindRequests.remove(key)?.completeExceptionally(
+                IllegalStateException(reason),
+            )
+        }
+        val subscriptionKeys = pendingSubscriptionRequests.keys.filter { it.startsWith(prefix) }
+        subscriptionKeys.forEach { key ->
+            pendingSubscriptionRequests.remove(key)?.completeExceptionally(
+                IllegalStateException(reason),
+            )
+        }
+        val publicationKeys = pendingPublicationRequests.keys.filter { it.startsWith(prefix) }
+        publicationKeys.forEach { key ->
+            pendingPublicationRequests.remove(key)?.completeExceptionally(
                 IllegalStateException(reason),
             )
         }
@@ -1590,11 +1926,52 @@ class BleMeshNetworkManager(
                 "elementAddress" to address,
                 "name" to (element.name ?: "Element 0x${address.toString(16)}"),
                 "modelIds" to (element.meshModels?.keys?.toList() ?: emptyList<Int>()),
+                "models" to buildModelConfigMaps(
+                    nodeAddress = meshNode.unicastAddress,
+                    elementAddress = address,
+                    element = element,
+                ),
                 "location" to element.locationDescriptor,
             )
         } ?: emptyList<Map<String, Any?>>()
 
-        // getAddedAppKeys() 返回 List<NodeKey>，NodeKey.index 为 AppKey 索引
+        return buildNodeMapCore(meshNode, elementsList)
+    }
+
+    private fun buildModelConfigMaps(
+        nodeAddress: Int,
+        elementAddress: Int,
+        element: Element,
+    ): List<Map<String, Any?>> =
+        element.meshModels?.entries?.map { (modelId, model) ->
+            val config = resolvedModelConfig(nodeAddress, elementAddress, modelId, model)
+            mapOf(
+                "modelId" to modelId,
+                "publishAddress" to config.publishAddress,
+                "subscriptionAddresses" to config.subscriptionAddresses,
+            )
+        } ?: emptyList()
+
+    /** 用 Composition Data 响应构造节点 Map（模型列表来自设备本次上报）。 */
+    private fun buildNodeMapFromComposition(
+        meshNode: ProvisionedMeshNode,
+        compositionStatus: ConfigCompositionDataStatus,
+    ): Map<String, Any?> {
+        val elementsList = compositionStatus.elements.entries.map { (address, element) ->
+            mapOf(
+                "elementAddress" to address,
+                "name" to (element.name ?: "Element 0x${address.toString(16)}"),
+                "modelIds" to element.meshModels.keys.toList(),
+                "location" to element.locationDescriptor,
+            )
+        }
+        return buildNodeMapCore(meshNode, elementsList)
+    }
+
+    private fun buildNodeMapCore(
+        meshNode: ProvisionedMeshNode,
+        elementsList: List<Map<String, Any?>>,
+    ): Map<String, Any?> {
         val appKeyIndexes = meshNode.addedAppKeys
             ?.filterIsInstance<NodeKey>()
             ?.map { it.index }

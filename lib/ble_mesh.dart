@@ -20,7 +20,9 @@ export 'src/enums/ble_mesh_enums.dart';
 export 'src/exceptions/ble_mesh_exception.dart';
 export 'src/models/ble_mesh_device.dart';
 export 'src/models/mesh_element.dart';
+export 'src/models/mesh_model_config.dart';
 export 'src/models/mesh_group.dart';
+export 'src/models/custom_ble_transfer_progress.dart';
 export 'src/models/mesh_configuration_status.dart';
 export 'src/models/mesh_message_status.dart';
 export 'src/models/mesh_network_info.dart';
@@ -31,6 +33,7 @@ import 'src/enums/ble_mesh_enums.dart';
 import 'src/exceptions/ble_mesh_exception.dart';
 import 'src/models/ble_mesh_device.dart';
 import 'src/models/mesh_group.dart';
+import 'src/models/custom_ble_transfer_progress.dart';
 import 'src/models/mesh_configuration_status.dart';
 import 'src/models/mesh_message_status.dart';
 import 'src/models/mesh_network_info.dart';
@@ -152,6 +155,38 @@ class BleMesh {
             e['state'] as String? ?? 'disconnected',
           ),
         );
+  }
+
+  /// 自定义 BLE 通道就绪状态（写特征已发现且可用）。
+  Stream<bool> get customBleChannelReady {
+    return _platform.meshEvents
+        .where((e) => e['type'] == MeshEventType.customBleChannelReady.name)
+        .map((e) => e['ready'] as bool? ?? false);
+  }
+
+  /// 自定义 BLE 分包传输进度。
+  Stream<CustomBleTransferProgress> get customBleTransferProgress {
+    return _platform.meshEvents
+        .where((e) => e['type'] == MeshEventType.customBleTransferProgress.name)
+        .map(
+          (e) => CustomBleTransferProgress(
+            bytesSent: e['bytesSent'] as int? ?? 0,
+            totalBytes: e['totalBytes'] as int? ?? 0,
+          ),
+        );
+  }
+
+  /// 自定义 BLE 通知特征收到的数据。
+  Stream<Uint8List> get customBleDataReceived {
+    return _platform.meshEvents
+        .where((e) => e['type'] == MeshEventType.customBleDataReceived.name)
+        .map((e) {
+          final raw = e['data'];
+          if (raw is List) {
+            return Uint8List.fromList(raw.cast<int>());
+          }
+          return Uint8List(0);
+        });
   }
 
   /// 节点从网络中删除完成。
@@ -341,6 +376,61 @@ class BleMesh {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // 4b. 自定义 BLE 通道（与 Proxy 共用 GATT，无需二次连接）
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// 注册自定义 Service / 特征 UUID；连接建立后会自动发现。
+  ///
+  /// 典型场景：Mesh Proxy (0x1828) 与固件自定义 Service 在同一 GATT 连接上，
+  /// 预览效果时直接往自定义写特征下发 bin，无需断开 Proxy。
+  Future<void> configureCustomBleChannel({
+    required String serviceUuid,
+    required String writeCharacteristicUuid,
+    String? notifyCharacteristicUuid,
+  }) async {
+    _ensureInitialized();
+    try {
+      await _platform.configureCustomBleChannel(
+        serviceUuid: serviceUuid,
+        writeCharacteristicUuid: writeCharacteristicUuid,
+        notifyCharacteristicUuid: notifyCharacteristicUuid,
+      );
+    } on PlatformException catch (e) {
+      throw _mapPlatformException(e);
+    }
+  }
+
+  /// 自定义写特征是否已就绪。
+  Future<bool> isCustomBleReady() async {
+    _ensureInitialized();
+    try {
+      return await _platform.isCustomBleReady();
+    } on PlatformException catch (e) {
+      throw _mapPlatformException(e);
+    }
+  }
+
+  /// 向自定义写特征写入单包数据。
+  Future<void> writeCustomBleData(Uint8List data) async {
+    _ensureInitialized();
+    try {
+      await _platform.writeCustomBleData(data);
+    } on PlatformException catch (e) {
+      throw _mapPlatformException(e);
+    }
+  }
+
+  /// 按当前 MTU 分包写入自定义特征（带响应写入，适合 bin 文件下发）。
+  Future<void> transferCustomBleData(Uint8List data) async {
+    _ensureInitialized();
+    try {
+      await _platform.transferCustomBleData(data);
+    } on PlatformException catch (e) {
+      throw _mapPlatformException(e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // 5. 节点管理
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -372,6 +462,23 @@ class BleMesh {
       }
     }
     return null;
+  }
+
+  /// 向设备请求最新的 Composition Data，返回设备上报的元素与模型列表。
+  ///
+  /// 需要 Proxy 已连接。返回的 [MeshNode.elements] 中 [MeshElement.modelIds]
+  /// 来自本次 `Config Composition Data Get` 响应，而非本地缓存快照。
+  ///
+  /// SIG 模型 ID 为 16 位（如 `0x1000`）；Vendor 模型为 32 位复合 ID
+  ///（`(companyId << 16) | modelId`，如 Espressif `0x02E50001`）。
+  Future<MeshNode> fetchReportedModels(int unicastAddress) async {
+    _ensureInitialized();
+    try {
+      final map = await _platform.fetchReportedModels(unicastAddress);
+      return MeshNode.fromMap(map);
+    } on PlatformException catch (e) {
+      throw _mapPlatformException(e);
+    }
   }
 
   /// 从网络中删除节点。
@@ -924,50 +1031,6 @@ class BleMesh {
     } on PlatformException catch (e) {
       throw _mapPlatformException(e);
     }
-  }
-
-  /// 设置节点主从角色（Vendor OpCode `0x11`）。
-  Future<void> setMasterSlaveRole({
-    required int address,
-    required MeshNodeRole role,
-    int companyId = kVendorCompanyId,
-    int appKeyIndex = 0,
-  }) async {
-    final message = MasterSlaveMessage(role: role, companyId: companyId);
-    developer.log(
-      '发送主从机切换: ${role.name} -> 0x${address.toRadixString(16)}',
-      name: 'ble_mesh',
-    );
-    await sendVendorMessage(
-      address: address,
-      companyId: message.companyId,
-      modelId: message.modelId,
-      opCode: message.opCode,
-      payload: message.payload.toList(),
-      appKeyIndex: appKeyIndex,
-    );
-  }
-
-  /// 设置播放模式（Vendor OpCode `0x11`，含亮度、速度、源类型等）。
-  Future<void> setPlayMode({
-    required int address,
-    required PlayModeConfig config,
-    int companyId = kVendorCompanyId,
-    int appKeyIndex = 0,
-  }) async {
-    final message = PlayModeMessage(config: config, companyId: companyId);
-    developer.log(
-      '发送播放模式: $config -> 0x${address.toRadixString(16)}',
-      name: 'ble_mesh',
-    );
-    await sendVendorMessage(
-      address: address,
-      companyId: message.companyId,
-      modelId: message.modelId,
-      opCode: message.opCode,
-      payload: message.payload.toList(),
-      appKeyIndex: appKeyIndex,
-    );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

@@ -15,6 +15,10 @@ import android.os.Looper
 import android.util.Log
 import java.util.LinkedList
 import java.util.UUID
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
  * BLE GATT 代理连接管理器。
@@ -55,7 +59,38 @@ class BleGattManager(
 
         /** GATT MTU 大小，BLE Mesh 建议值 */
         private const val MESH_MTU = 517
+
+        /** 将 16/32 位短 UUID（含 0x 前缀）或完整 UUID 字符串解析为 [UUID]。 */
+        fun parseBleUuid(value: String): UUID {
+            val hex = normalizeBleUuidHex(value)
+            return when (hex.length) {
+                4 -> UUID.fromString(
+                    "0000$hex-0000-1000-8000-00805F9B34FB",
+                )
+                8 -> UUID.fromString(
+                    "0000${hex.takeLast(4)}-0000-1000-8000-00805F9B34FB",
+                )
+                else -> UUID.fromString(value.trim())
+            }
+        }
+
+        /** 去掉 0x 前缀并转为大写十六进制（不含连字符的短 UUID）。 */
+        fun normalizeBleUuidHex(value: String): String {
+            var s = value.trim()
+            if (s.startsWith("0x", ignoreCase = true)) {
+                s = s.substring(2)
+            }
+            if (s.contains("-")) {
+                return s.uppercase()
+            }
+            return s.uppercase()
+        }
     }
+
+    private data class CustomWriteItem(
+        val data: ByteArray,
+        val onSuccess: (() -> Unit)? = null,
+    )
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -98,6 +133,28 @@ class BleGattManager(
     /** NO_RESPONSE 写入后的最小间隔，避免 GATT 繁忙丢包。 */
     private val proxyWriteGapMs = 8L
 
+    // ── 自定义 BLE 通道（与 Proxy 共用 GATT 连接）────────────────────────────
+
+    private var customServiceUuid: UUID? = null
+    private var customWriteUuid: UUID? = null
+    private var customNotifyUuid: UUID? = null
+    private var customWriteCharacteristic: BluetoothGattCharacteristic? = null
+    private var customNotifyCharacteristic: BluetoothGattCharacteristic? = null
+
+    @Volatile
+    private var customChannelReady = false
+
+    private val customWriteQueue = LinkedList<CustomWriteItem>()
+
+    @Volatile
+    private var customWriting = false
+
+    @Volatile
+    private var activeTransferDeferred: CompletableDeferred<Unit>? = null
+
+    private var activeTransferTotalBytes = 0
+    private var activeTransferBytesSent = 0
+
     // ── GATT 回调 ──────────────────────────────────────────────────────────────
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -120,6 +177,7 @@ class BleGattManager(
                     targetAddress = null
                     dataInCharacteristic = null
                     proxyNotificationsReady = false
+                    clearCustomChannel(failActiveTransfer = true)
                     synchronized(writeQueue) {
                         writeQueue.clear()
                         isWriting = false
@@ -163,6 +221,8 @@ class BleGattManager(
             if (dataOut != null) {
                 enableNotifications(gatt, dataOut)
             }
+
+            resolveCustomCharacteristics(gatt)
         }
 
         override fun onCharacteristicChanged(
@@ -173,8 +233,19 @@ class BleGattManager(
                 @Suppress("DEPRECATION")
                 val value = characteristic.value ?: return
                 Log.v(TAG, "收到代理数据: ${value.size} 字节")
-                // 将收到的加密 PDU 传递给 nRF Mesh 库解密、解析
                 networkManager.meshManagerApi.handleNotifications(currentMtu, value)
+                return
+            }
+            val notifyUuid = customNotifyUuid
+            if (notifyUuid != null && characteristic.uuid == notifyUuid) {
+                @Suppress("DEPRECATION")
+                val value = characteristic.value ?: return
+                MeshEventStreamHandler.sendEvent(
+                    mapOf(
+                        "type" to "customBleDataReceived",
+                        "data" to value.map { it.toInt() and 0xFF },
+                    ),
+                )
             }
         }
 
@@ -184,6 +255,11 @@ class BleGattManager(
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
+            val writeUuid = customWriteUuid
+            if (writeUuid != null && characteristic.uuid == writeUuid) {
+                handleCustomWriteComplete(status)
+                return
+            }
             if (characteristic.uuid != MESH_PROXY_DATA_IN) return
             synchronized(writeQueue) {
                 if (!isWriting) return
@@ -209,13 +285,18 @@ class BleGattManager(
             descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
-            if (descriptor.uuid == CCCD_UUID && status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "通知已开启，代理连接就绪")
-                proxyNotificationsReady = true
-                MeshEventStreamHandler.sendConnectionState("connected", gatt.device.address)
-                // Proxy 就绪后自动触发 AppKey 分发（首次配网后立即可控制）
-                networkManager.onProxyConnected()
+            if (descriptor.uuid != CCCD_UUID || status != BluetoothGatt.GATT_SUCCESS) {
+                return
             }
+            // 仅 Proxy Data Out 的 CCCD 表示 Mesh Proxy 就绪，勿与自定义 notify 混淆
+            if (descriptor.characteristic?.uuid != MESH_PROXY_DATA_OUT) {
+                return
+            }
+            Log.d(TAG, "通知已开启，代理连接就绪")
+            proxyNotificationsReady = true
+            MeshEventStreamHandler.sendConnectionState("connected", gatt.device.address)
+            // Proxy 就绪后自动触发 AppKey 分发（首次配网后立即可控制）
+            networkManager.onProxyConnected()
         }
     }
 
@@ -270,6 +351,7 @@ class BleGattManager(
             writeQueue.clear()
             isWriting = false
         }
+        clearCustomChannel(failActiveTransfer = true)
         targetAddress = null
         proxyNotificationsReady = false
         dataInCharacteristic = null
@@ -334,6 +416,106 @@ class BleGattManager(
      */
     fun getMtu(): Int = currentMtu
 
+    /**
+     * 配置自定义 BLE 通道 UUID；若 GATT 已连接会立即尝试发现特征。
+     */
+    fun configureCustomChannel(
+        serviceUuid: String,
+        writeCharacteristicUuid: String,
+        notifyCharacteristicUuid: String?,
+    ) {
+        val serviceUuidParsed = parseBleUuid(serviceUuid)
+        val writeUuidParsed = parseBleUuid(writeCharacteristicUuid)
+        val notifyUuidParsed = notifyCharacteristicUuid?.let { parseBleUuid(it) }
+        if (customServiceUuid == serviceUuidParsed &&
+            customWriteUuid == writeUuidParsed &&
+            customNotifyUuid == notifyUuidParsed &&
+            customChannelReady &&
+            customWriteCharacteristic != null
+        ) {
+            return
+        }
+        customServiceUuid = serviceUuidParsed
+        customWriteUuid = writeUuidParsed
+        customNotifyUuid = notifyUuidParsed
+        customChannelReady = false
+        customWriteCharacteristic = null
+        customNotifyCharacteristic = null
+        bluetoothGatt?.let { gatt ->
+            val serviceUuidParsed = customServiceUuid ?: return@let
+            if (gatt.getService(serviceUuidParsed) != null) {
+                resolveCustomCharacteristics(gatt)
+            } else {
+                Log.d(TAG, "自定义 Service 未缓存，重新发现 GATT 服务…")
+                gatt.discoverServices()
+            }
+        }
+    }
+
+    /** 自定义写特征是否已就绪。 */
+    fun isCustomChannelReady(): Boolean =
+        customChannelReady && customWriteCharacteristic != null
+
+    /** 写入单包自定义数据（不超过当前 MTU）。 */
+    suspend fun writeCustomData(data: ByteArray) {
+        if (!isCustomChannelReady()) {
+            throw IllegalStateException("自定义 BLE 通道未就绪")
+        }
+        if (data.size > currentMtu) {
+            throw IllegalArgumentException("数据长度 ${data.size} 超过 MTU $currentMtu")
+        }
+        suspendCancellableCoroutine { cont ->
+            val item = CustomWriteItem(data) {
+                cont.resume(Unit)
+            }
+            synchronized(customWriteQueue) { customWriteQueue.add(item) }
+            cont.invokeOnCancellation {
+                synchronized(customWriteQueue) { customWriteQueue.remove(item) }
+            }
+            drainCustomWriteQueue()
+        }
+    }
+
+    /** 按 MTU 分包写入自定义数据（带响应写入）。 */
+    suspend fun transferCustomData(data: ByteArray) {
+        if (!isCustomChannelReady()) {
+            throw IllegalStateException("自定义 BLE 通道未就绪")
+        }
+        if (data.isEmpty()) return
+        val chunkSize = maxOf(20, minOf(currentMtu, 512))
+        activeTransferDeferred?.completeExceptionally(
+            IllegalStateException("上一次传输被新请求取代"),
+        )
+        val deferred = CompletableDeferred<Unit>()
+        activeTransferDeferred = deferred
+        activeTransferTotalBytes = data.size
+        activeTransferBytesSent = 0
+        var offset = 0
+        while (offset < data.size) {
+            val end = minOf(offset + chunkSize, data.size)
+            val chunk = data.copyOfRange(offset, end)
+            val isLast = end == data.size
+            val item = CustomWriteItem(chunk) {
+                activeTransferBytesSent += chunk.size
+                MeshEventStreamHandler.sendEvent(
+                    mapOf(
+                        "type" to "customBleTransferProgress",
+                        "bytesSent" to activeTransferBytesSent,
+                        "totalBytes" to activeTransferTotalBytes,
+                    ),
+                )
+                if (isLast) {
+                    activeTransferDeferred = null
+                    deferred.complete(Unit)
+                }
+            }
+            synchronized(customWriteQueue) { customWriteQueue.add(item) }
+            offset = end
+        }
+        drainCustomWriteQueue()
+        deferred.await()
+    }
+
     // ── 私有方法 ───────────────────────────────────────────────────────────────
 
     /**
@@ -379,5 +561,84 @@ class BleGattManager(
         val descriptor = characteristic.getDescriptor(CCCD_UUID) ?: return
         descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         gatt.writeDescriptor(descriptor)
+    }
+
+    private fun resolveCustomCharacteristics(gatt: BluetoothGatt) {
+        val serviceUuid = customServiceUuid ?: return
+        val writeUuid = customWriteUuid ?: return
+        val service = gatt.getService(serviceUuid) ?: return
+        customWriteCharacteristic = service.getCharacteristic(writeUuid)
+        customNotifyUuid?.let { notifyUuid ->
+            val notifyChar = service.getCharacteristic(notifyUuid)
+            customNotifyCharacteristic = notifyChar
+            notifyChar?.let { enableNotifications(gatt, it) }
+        }
+        val ready = customWriteCharacteristic != null
+        if (ready != customChannelReady) {
+            customChannelReady = ready
+            if (ready) {
+                Log.d(TAG, "自定义 BLE 通道已就绪")
+                MeshEventStreamHandler.sendEvent(
+                    mapOf("type" to "customBleChannelReady", "ready" to true),
+                )
+            }
+        }
+    }
+
+    private fun clearCustomChannel(failActiveTransfer: Boolean) {
+        if (failActiveTransfer) {
+            activeTransferDeferred?.completeExceptionally(
+                IllegalStateException("GATT 连接已断开"),
+            )
+        }
+        activeTransferDeferred = null
+        synchronized(customWriteQueue) {
+            customWriteQueue.clear()
+            customWriting = false
+        }
+        customWriteCharacteristic = null
+        customNotifyCharacteristic = null
+        customChannelReady = false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun drainCustomWriteQueue() {
+        synchronized(customWriteQueue) {
+            if (customWriting || customWriteQueue.isEmpty()) return
+            val item = customWriteQueue.peek() ?: return
+            val gatt = bluetoothGatt ?: return
+            val characteristic = customWriteCharacteristic ?: return
+            customWriting = true
+            characteristic.value = item.data
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            val ok = gatt.writeCharacteristic(characteristic)
+            if (!ok) {
+                customWriting = false
+                mainHandler.postDelayed({ drainCustomWriteQueue() }, 20L)
+            }
+        }
+    }
+
+    private fun handleCustomWriteComplete(status: Int) {
+        val item: CustomWriteItem?
+        synchronized(customWriteQueue) {
+            customWriting = false
+            item = if (status == BluetoothGatt.GATT_SUCCESS) {
+                customWriteQueue.poll()
+            } else {
+                customWriteQueue.clear()
+                null
+            }
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            Log.e(TAG, "自定义 BLE 写入失败，status=$status")
+            activeTransferDeferred?.completeExceptionally(
+                IllegalStateException("自定义 BLE 写入失败: $status"),
+            )
+            activeTransferDeferred = null
+            return
+        }
+        item?.onSuccess?.invoke()
+        mainHandler.post { drainCustomWriteQueue() }
     }
 }

@@ -1,4 +1,4 @@
-import Flutter
+    import Flutter
 import CoreBluetooth
 import NordicMesh
 import UIKit
@@ -60,6 +60,27 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
     /// GATT Proxy 写入队列（对齐 Android BleGattManager.writeQueue 串行写）。
     private var proxyWriteQueue: [Data] = []
     private var proxyWriteInProgress = false
+
+    // ── 自定义 BLE 通道（与 Proxy 共用 GATT 连接）────────────────────────────
+
+    private var customServiceUuid: CBUUID?
+    private var customWriteUuid: CBUUID?
+    private var customNotifyUuid: CBUUID?
+    private var customWriteCharacteristic: CBCharacteristic?
+    private var customNotifyCharacteristic: CBCharacteristic?
+    private var customChannelReady = false
+
+    private struct CustomWriteItem {
+        let data: Data
+        let onSuccess: (() -> Void)?
+    }
+
+    private var customWriteQueue: [CustomWriteItem] = []
+    private var customWriteInProgress = false
+    private var pendingCustomWriteSuccess: (() -> Void)?
+    private var customTransferCompletion: ((Error?) -> Void)?
+    private var customTransferTotalBytes = 0
+    private var customTransferBytesSent = 0
 
     /// 删除节点前若 Proxy 未连接，先连上再发 ConfigNodeReset。
     private var pendingDeleteUnicastAddress: UInt16?
@@ -276,6 +297,58 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
         // ── 节点、分组、场景管理（iOS 本地缓存实现） ───────────────────────
         case "getNodes":
             result(meshBridge?.getNodes() ?? nodes)
+
+        case "fetchReportedModels":
+            guard let unicastAddress = args?["unicastAddress"] as? Int else {
+                result(FlutterError(
+                    code: "INVALID_ARGUMENT",
+                    message: "缺少 unicastAddress 参数",
+                    details: nil
+                ))
+                return
+            }
+            guard let bridge = meshBridge else {
+                result(FlutterError(
+                    code: "NOT_INITIALIZED",
+                    message: "请先调用 initialize()",
+                    details: nil
+                ))
+                return
+            }
+            Task {
+                do {
+                    let nodeMap = try await bridge.fetchReportedModels(
+                        unicastAddress: UInt16(unicastAddress)
+                    )
+                    await MainActor.run { result(nodeMap) }
+                } catch let error as MeshBridgeError {
+                    await MainActor.run {
+                        let message = error.localizedDescription ?? "Composition 失败"
+                        let code: String
+                        switch error {
+                        case .configFailed(let msg) where msg.contains("Proxy"):
+                            code = "NOT_CONNECTED"
+                        case .configFailed(let msg) where msg.contains("不存在"):
+                            code = "NODE_NOT_FOUND"
+                        default:
+                            code = "COMPOSITION_FAILED"
+                        }
+                        result(FlutterError(
+                            code: code,
+                            message: message,
+                            details: nil
+                        ))
+                    }
+                } catch {
+                    await MainActor.run {
+                        result(FlutterError(
+                            code: "COMPOSITION_FAILED",
+                            message: error.localizedDescription,
+                            details: nil
+                        ))
+                    }
+                }
+            }
 
         case "deleteNode":
             guard let unicastAddress = args?["unicastAddress"] as? Int else {
@@ -551,6 +624,41 @@ public class BleMeshPlugin: NSObject, FlutterPlugin {
                     }
                 }
             }
+
+        case "configureCustomBleChannel":
+            guard let serviceUuid = args?["serviceUuid"] as? String,
+                  let writeUuid = args?["writeCharacteristicUuid"] as? String else {
+                result(FlutterError(
+                    code: "INVALID_ARGUMENT",
+                    message: "缺少 serviceUuid 或 writeCharacteristicUuid",
+                    details: nil
+                ))
+                return
+            }
+            let notifyUuid = args?["notifyCharacteristicUuid"] as? String
+            configureCustomBleChannel(
+                serviceUuid: serviceUuid,
+                writeUuid: writeUuid,
+                notifyUuid: notifyUuid
+            )
+            result(nil)
+
+        case "isCustomBleReady":
+            result(customChannelReady)
+
+        case "writeCustomBleData":
+            guard let data = dataFromMethodArgs(args, key: "data") else {
+                result(FlutterError(code: "INVALID_ARGUMENT", message: "缺少 data", details: nil))
+                return
+            }
+            writeCustomBleData(data: data, result: result)
+
+        case "transferCustomBleData":
+            guard let data = dataFromMethodArgs(args, key: "data") else {
+                result(FlutterError(code: "INVALID_ARGUMENT", message: "缺少 data", details: nil))
+                return
+            }
+            transferCustomBleData(data: data, result: result)
 
         default:
             result(FlutterMethodNotImplemented)
@@ -1564,7 +1672,11 @@ extension BleMeshPlugin: CBCentralManagerDelegate {
         proxyConnectTimer?.invalidate()
         proxyConnectTimer = nil
         pendingProxyAddress = nil
-        peripheral.discoverServices([kMeshProxyServiceUUID])
+        if customServiceUuid != nil {
+            peripheral.discoverServices(nil)
+        } else {
+            peripheral.discoverServices([kMeshProxyServiceUUID])
+        }
     }
 
     public func centralManager(
@@ -1599,10 +1711,217 @@ extension BleMeshPlugin: CBCentralManagerDelegate {
         dataInCharacteristic = nil
         proxyNotificationsReady = false
         clearProxyWriteQueue()
+        clearCustomChannel(failActiveTransfer: true)
         meshBridge?.notifyProxyDisconnected()
         sendEvent(["type": "connectionStateChanged", "state": "disconnected"])
         resumePendingDeleteAfterDisconnect()
         resumePendingProvisionAfterDisconnect()
+    }
+}
+
+// MARK: - 自定义 BLE 通道
+
+extension BleMeshPlugin {
+
+    /// 从 MethodChannel 参数解析二进制数据。
+    ///
+    /// Dart 的 `Uint8List` 在 iOS 侧为 [FlutterStandardTypedData]，
+    /// 不能强转为 `[Int]`。
+    private func dataFromMethodArgs(
+        _ args: [String: Any]?,
+        key: String
+    ) -> Data? {
+        guard let raw = args?[key] else { return nil }
+        if let data = raw as? Data { return data }
+        if let typed = raw as? FlutterStandardTypedData { return typed.data }
+        if let list = raw as? [Int] {
+            return Data(list.map { UInt8($0 & 0xFF) })
+        }
+        if let list = raw as? [NSNumber] {
+            return Data(list.map { UInt8(truncatingIfNeeded: $0.intValue) })
+        }
+        return nil
+    }
+
+    private func parseBleUuid(_ value: String) -> CBUUID {
+        var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("0x") {
+            trimmed = String(trimmed.dropFirst(2))
+        }
+        if trimmed.contains("-") {
+            return CBUUID(string: trimmed)
+        }
+        return CBUUID(string: trimmed)
+    }
+
+    private func configureCustomBleChannel(
+        serviceUuid: String,
+        writeUuid: String,
+        notifyUuid: String?
+    ) {
+        let parsedService = parseBleUuid(serviceUuid)
+        let parsedWrite = parseBleUuid(writeUuid)
+        let parsedNotify = notifyUuid.map { parseBleUuid($0) }
+        if customServiceUuid == parsedService &&
+            customWriteUuid == parsedWrite &&
+            customNotifyUuid == parsedNotify &&
+            customChannelReady &&
+            customWriteCharacteristic != nil {
+            return
+        }
+        customServiceUuid = parsedService
+        customWriteUuid = parsedWrite
+        customNotifyUuid = parsedNotify
+        customChannelReady = false
+        customWriteCharacteristic = nil
+        customNotifyCharacteristic = nil
+        guard let peripheral = connectedPeripheral,
+              let customUuid = customServiceUuid else { return }
+        if let customService = peripheral.services?.first(where: { $0.uuid == customUuid }) {
+            peripheral.discoverCharacteristics(nil, for: customService)
+        } else {
+            MeshLog.d("GATT", "自定义 Service 未缓存，重新发现 GATT 服务…")
+            peripheral.discoverServices(nil)
+        }
+    }
+
+    private func markCustomChannelReadyIfNeeded() {
+        let ready = customWriteCharacteristic != nil
+        guard ready != customChannelReady else { return }
+        customChannelReady = ready
+        if ready {
+            MeshLog.d("GATT", "自定义 BLE 通道已就绪")
+            sendEvent(["type": "customBleChannelReady", "ready": true])
+        }
+    }
+
+    private func clearCustomChannel(failActiveTransfer: Bool) {
+        if failActiveTransfer {
+            customTransferCompletion?(NSError(
+                domain: "BleMesh",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "GATT 连接已断开"]
+            ))
+        }
+        customTransferCompletion = nil
+        customWriteQueue.removeAll()
+        customWriteInProgress = false
+        customWriteCharacteristic = nil
+        customNotifyCharacteristic = nil
+        customChannelReady = false
+    }
+
+    private func customBleChunkSize(for peripheral: CBPeripheral) -> Int {
+        max(peripheral.maximumWriteValueLength(for: .withResponse), 20)
+    }
+
+    private func writeCustomBleData(data: Data, result: @escaping FlutterResult) {
+        guard customChannelReady, let peripheral = connectedPeripheral,
+              let characteristic = customWriteCharacteristic else {
+            result(FlutterError(
+                code: "CUSTOM_BLE_NOT_READY",
+                message: "自定义 BLE 通道未就绪",
+                details: nil
+            ))
+            return
+        }
+        let maxLen = customBleChunkSize(for: peripheral)
+        guard data.count <= maxLen else {
+            result(FlutterError(
+                code: "CUSTOM_BLE_DATA_TOO_LARGE",
+                message: "数据长度 \(data.count) 超过单包上限 \(maxLen)",
+                details: nil
+            ))
+            return
+        }
+        let item = CustomWriteItem(data: data) {
+            result(nil)
+        }
+        customWriteQueue.append(item)
+        drainCustomWriteQueue()
+    }
+
+    private func transferCustomBleData(data: Data, result: @escaping FlutterResult) {
+        guard customChannelReady, let peripheral = connectedPeripheral else {
+            result(FlutterError(
+                code: "CUSTOM_BLE_NOT_READY",
+                message: "自定义 BLE 通道未就绪",
+                details: nil
+            ))
+            return
+        }
+        guard !data.isEmpty else {
+            result(nil)
+            return
+        }
+        customTransferCompletion?(NSError(
+            domain: "BleMesh",
+            code: -2,
+            userInfo: [NSLocalizedDescriptionKey: "上一次传输被新请求取代"]
+        ))
+        customTransferTotalBytes = data.count
+        customTransferBytesSent = 0
+        let chunkSize = customBleChunkSize(for: peripheral)
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + chunkSize, data.count)
+            let chunk = data.subdata(in: offset..<end)
+            let isLast = end == data.count
+            let item = CustomWriteItem(data: chunk) { [weak self] in
+                guard let self else { return }
+                self.customTransferBytesSent += chunk.count
+                self.sendEvent([
+                    "type": "customBleTransferProgress",
+                    "bytesSent": self.customTransferBytesSent,
+                    "totalBytes": self.customTransferTotalBytes,
+                ])
+                if isLast {
+                    self.customTransferCompletion?(nil)
+                    self.customTransferCompletion = nil
+                }
+            }
+            customWriteQueue.append(item)
+            offset = end
+        }
+        customTransferCompletion = { error in
+            if let error {
+                result(FlutterError(
+                    code: "CUSTOM_BLE_TRANSFER_FAILED",
+                    message: error.localizedDescription,
+                    details: nil
+                ))
+            } else {
+                result(nil)
+            }
+        }
+        drainCustomWriteQueue()
+    }
+
+    private func drainCustomWriteQueue() {
+        guard !customWriteInProgress,
+              !customWriteQueue.isEmpty,
+              let peripheral = connectedPeripheral,
+              let characteristic = customWriteCharacteristic else { return }
+
+        let item = customWriteQueue.removeFirst()
+        customWriteInProgress = true
+        pendingCustomWriteSuccess = item.onSuccess
+        peripheral.writeValue(item.data, for: characteristic, type: .withResponse)
+    }
+
+    private func handleCustomWriteComplete(error: Error?) {
+        customWriteInProgress = false
+        if let error {
+            MeshLog.e("自定义 BLE 写入失败: \(error.localizedDescription)")
+            customWriteQueue.removeAll()
+            customTransferCompletion?(error)
+            customTransferCompletion = nil
+            pendingCustomWriteSuccess = nil
+            return
+        }
+        pendingCustomWriteSuccess?()
+        pendingCustomWriteSuccess = nil
+        drainCustomWriteQueue()
     }
 }
 
@@ -1635,6 +1954,11 @@ extension BleMeshPlugin: CBPeripheralDelegate {
             [kMeshProxyDataInUUID, kMeshProxyDataOutUUID],
             for: proxyService
         )
+
+        if let customUuid = customServiceUuid,
+           let customService = peripheral.services?.first(where: { $0.uuid == customUuid }) {
+            peripheral.discoverCharacteristics(nil, for: customService)
+        }
     }
 
     public func peripheral(
@@ -1643,6 +1967,20 @@ extension BleMeshPlugin: CBPeripheralDelegate {
         error: Error?
     ) {
         guard error == nil else { return }
+
+        if let customUuid = customServiceUuid, service.uuid == customUuid {
+            for characteristic in service.characteristics ?? [] {
+                if let writeUuid = customWriteUuid, characteristic.uuid == writeUuid {
+                    customWriteCharacteristic = characteristic
+                }
+                if let notifyUuid = customNotifyUuid, characteristic.uuid == notifyUuid {
+                    customNotifyCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
+            }
+            markCustomChannelReadyIfNeeded()
+            return
+        }
 
         for characteristic in service.characteristics ?? [] {
             switch characteristic.uuid {
@@ -1701,6 +2039,10 @@ extension BleMeshPlugin: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        if let writeUuid = customWriteUuid, characteristic.uuid == writeUuid {
+            handleCustomWriteComplete(error: error)
+            return
+        }
         guard characteristic.uuid == kMeshProxyDataInUUID else { return }
         proxyWriteInProgress = false
         if let error {
@@ -1717,6 +2059,16 @@ extension BleMeshPlugin: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        if let notifyUuid = customNotifyUuid,
+           characteristic.uuid == notifyUuid,
+           let data = characteristic.value {
+            sendEvent([
+                "type": "customBleDataReceived",
+                "data": data.map { Int($0) },
+            ])
+            return
+        }
+
         guard characteristic.uuid == kMeshProxyDataOutUUID,
               let data = characteristic.value else { return }
 

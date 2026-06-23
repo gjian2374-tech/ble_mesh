@@ -69,6 +69,8 @@ abstract class BleMeshPlatform extends PlatformInterface {
 
   Future<List<Map<dynamic, dynamic>>> getNodes();
 
+  Future<Map<dynamic, dynamic>> fetchReportedModels(int unicastAddress);
+
   Future<void> deleteNode(int unicastAddress);
 
   Future<List<Map<dynamic, dynamic>>> getGroups();
@@ -117,4 +119,20 @@ abstract class BleMeshPlatform extends PlatformInterface {
     int publishTtl = 5,
     int publishPeriod = 0,
   });
+
+  /// 配置自定义 BLE GATT 通道（与 Proxy 共用同一连接）。
+  Future<void> configureCustomBleChannel({
+    required String serviceUuid,
+    required String writeCharacteristicUuid,
+    String? notifyCharacteristicUuid,
+  });
+
+  /// 自定义 BLE 写特征是否已就绪。
+  Future<bool> isCustomBleReady();
+
+  /// 向自定义写特征写入单包数据（不超过当前 MTU）。
+  Future<void> writeCustomBleData(List<int> data);
+
+  /// 按 MTU 分包写入自定义特征（带响应写入，适合 bin 下发）。
+  Future<void> transferCustomBleData(List<int> data);
 }

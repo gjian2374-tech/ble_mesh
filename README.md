@@ -17,7 +17,8 @@ A Flutter BLE Mesh plugin that implements real PB-GATT provisioning, Proxy conne
 | Sync Group | ✅ | ✅ | Vendor **0x0001** / **0x0002**, `configureSyncModels` / `configureSyncMaster/Slave` |
 | Node deletion | ✅ | ✅ | Config Node Reset + local network sync |
 | Network import/export | ✅ | ✅ | nRF Mesh App compatible JSON |
-| Vendor messages | ✅ | ✅ | Espressif CID 0x02E5 master/slave switching, play mode, etc. |
+| Vendor messages | ✅ | ✅ | Espressif CID 0x02E5 custom vendor messaging |
+| **Custom BLE GATT channel** | ✅ | ✅ | Write bin / raw bytes on a custom Service **over the same GATT connection as Proxy** (no second BLE plugin connection) |
 | Scene management | ⚠️ Native layer | ⚠️ Local placeholder | **Not yet exposed in Dart**; Android native can send Scene messages, iOS uses local cache placeholder |
 | Light Lightness | ⚠️ Native layer | ⚠️ Native layer | **Not yet exposed as a public Dart API** |
 
@@ -35,6 +36,7 @@ Flutter (Dart)
 | **Provisioning** | PB-GATT (0x1827) → key exchange → write to Nordic Mesh DB |
 | **Auto-configuration** | After Proxy is ready → `ConfigCompositionDataGet` → `ConfigAppKeyAdd` → `ConfigModelAppBind` |
 | **Control** | Proxy GATT (0x1828) → Nordic encryption stack → unicast/multicast Mesh messages |
+| **Custom GATT** | Same GATT session as Proxy → discover firmware Service (e.g. `0xFFF0`) → write bin or opcodes to custom characteristics |
 | **Grouping** | Create group → `ConfigModelSubscriptionAdd` / `Delete` → send control messages to group address |
 
 After provisioning completes, the **native layer automatically connects to Proxy and distributes AppKey / model bindings** (actively scans for Proxy advertising instead of a fixed wait). The Dart layer should listen to `configurationState` and wait for `complete` — **do not call `distributeAppKey()` on every Proxy connection**.
@@ -109,6 +111,17 @@ mesh.configurationState.listen((status) {
 
 // Proxy connection state
 mesh.connectionState.listen((state) { /* connected / disconnected */ });
+
+// Custom BLE channel (same GATT as Proxy)
+mesh.customBleChannelReady.listen((ready) {
+  print('Custom GATT write characteristic ready: $ready');
+});
+mesh.customBleTransferProgress.listen((p) {
+  print('Bin transfer ${p.bytesSent}/${p.totalBytes}');
+});
+mesh.customBleDataReceived.listen((data) {
+  print('Notify: ${data.map((b) => b.toRadixString(16)).join(' ')}');
+});
 
 // Node deletion complete
 mesh.nodeDeleted.listen((unicastAddress) {
@@ -187,6 +200,22 @@ Use `isProxyReady(address)` to check whether the Proxy channel is fully ready (G
 await mesh.sendGenericOnOff(address: 0x0002, onOff: true);
 await mesh.sendGenericLevel(address: 0x0002, level: 16384);
 ```
+
+#### Query device-reported models
+
+After Proxy is connected, fetch the latest Composition Data from the device:
+
+```dart
+final node = await mesh.fetchReportedModels(0x0002);
+for (final element in node.elements) {
+  print('${element.hexAddress}: ${element.modelIds.length} models');
+  for (final modelId in element.modelIds) {
+    print('  model 0x${modelId.toRadixString(16)}');
+  }
+}
+```
+
+Unlike `getNodes()` (local Mesh DB snapshot), `fetchReportedModels()` sends `Config Composition Data Get` and returns models from the device's live response.
 
 ### 7. Group Control
 
@@ -370,21 +399,19 @@ Format is compatible with the nRF Mesh App Mesh Configuration Database.
 
 ### 11. Vendor Device Control (Espressif)
 
-```dart
-await mesh.setMasterSlaveRole(address: 0x0002, role: MeshNodeRole.master);
+Use [sendVendorMessage] with company ID, model ID, and payload from your device spec:
 
-await mesh.setPlayMode(
-  address: 0x0002,
-  config: PlayModeConfig(
-    sourceType: SourceType.sdCard,
-    modeIndex: 1,
-    speed: 5,
-    brightness: 32768,
-  ),
+```dart
+await mesh.sendVendorMessage(
+  address: targetAddress,
+  companyId: kVendorCompanyId,
+  modelId: kDeviceControlModelId,
+  opCode: vendorOp,
+  payload: vendorPayload,
 );
 
 mesh.vendorMessages.listen((status) {
-  print('Vendor ${status.hexSource} op=0x${status.opCode.toRadixString(16)}');
+  print('Vendor ${status.hexSource} model=0x${status.modelId.toRadixString(16)}');
 });
 ```
 
@@ -394,6 +421,86 @@ mesh.vendorMessages.listen((status) {
 | `kDefaultSyncGroupAddress` | `0xC000` | Sync multicast address |
 | `kDefaultControlGroupAddress` | `0xC001` | Default control group |
 | `kGenericOnOffModelId` | `0x1000` | SIG Generic OnOff Server |
+
+### 12. Custom BLE GATT Channel (same connection as Proxy)
+
+Many firmware stacks expose **both** Mesh Proxy Service (`0x1828`) and a **vendor-specific GATT Service** (e.g. `0xFFF0`) on the **same BLE link**. nRF Mesh and nRF Connect can both connect because they use different services on one GATT session.
+
+This plugin lets you write to that custom Service **without disconnecting Proxy** — suitable for effect preview, firmware bin download, or single-byte opcodes (`0x01` = turn on, per your firmware spec).
+
+```
+Phone App
+  └── one BLE GATT connection
+        ├── 0x1828 Mesh Proxy        → Mesh control (existing APIs)
+        └── 0xFFF0 custom Service    → bin / opcode writes (this section)
+```
+
+> **Do you need `flutter_blue_plus`?**  
+> Generally **no** for “Mesh connected → send bin seamlessly”. A second BLE plugin would open another GATT connection and usually **conflicts** with Proxy on the same device. Use this built-in channel instead.
+
+#### Prerequisites
+
+1. Proxy is connected (`connectToProxy` / `isProxyReady`)
+2. Register your firmware UUIDs once (short or full UUID strings are accepted)
+
+Supported UUID string formats:
+
+| Format | Example |
+|--------|---------|
+| `0x` prefix | `0xFFF0`, `0xFFF2` |
+| 16-bit hex | `FFF0` |
+| 128-bit UUID | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` |
+
+#### Configure and check readiness
+
+```dart
+await mesh.configureCustomBleChannel(
+  serviceUuid: '0xFFF0',
+  writeCharacteristicUuid: '0xFFF2',
+  notifyCharacteristicUuid: '0xFFF1', // optional
+);
+
+// Poll or listen to customBleChannelReady
+final ready = await mesh.isCustomBleReady();
+```
+
+If UUIDs are configured **after** Proxy is already connected, native code re-discovers GATT services automatically.
+
+#### Single-byte opcode (custom protocol, not Mesh)
+
+```dart
+import 'dart:typed_data';
+
+// Firmware-defined: e.g. 0x01 = light on on the custom write characteristic
+await mesh.writeCustomBleData(Uint8List.fromList([0x01]));
+```
+
+This is **not** the same as Mesh `sendGenericOnOff` — it writes raw bytes to your custom characteristic.
+
+#### Transfer a bin file (chunked, with response writes)
+
+```dart
+final bin = Uint8List.fromList([/* your 80-byte payload */]);
+await mesh.transferCustomBleData(bin);
+
+// Optional progress
+mesh.customBleTransferProgress.listen((p) {
+  print('${(p.fraction * 100).toStringAsFixed(0)}%');
+});
+```
+
+`transferCustomBleData` splits by negotiated ATT MTU and uses **write-with-response** for reliability. `writeCustomBleData` sends a **single** packet (must fit in one ATT payload).
+
+#### Mesh vs custom GATT — when to use which
+
+| Goal | API |
+|------|-----|
+| SIG On/Off over Mesh | `sendGenericOnOff(address: node.unicastAddress, onOff: true)` |
+| Vendor Mesh message | `sendVendorMessage(...)` |
+| Raw `0x01` on custom Service | `writeCustomBleData(Uint8List.fromList([0x01]))` |
+| Effect preview / `.bin` file | `transferCustomBleData(bytes)` |
+
+The **Example app** node control page includes a **Custom Effect Preview** screen (configure UUIDs, send `0x01`/`0x00`, transfer demo bin).
 
 ## Complete Workflow
 
@@ -409,6 +516,8 @@ initializeAndWaitForNetwork
  connectToProxy (if not already connected)
         ↓
  Unicast control / ensureGroup → addModelSubscription → multicast
+        ↓
+ configureCustomBleChannel → writeCustomBleData / transferCustomBleData (optional, same GATT)
         ↓
  changeNodeGroup (optional: move to another group)
 ```
@@ -447,6 +556,7 @@ Filter Console by `BleMesh` or the following tags:
 | `[DELETE]` | Node deletion and reset |
 | `[GROUP]` | AppKey / Bind / Subscription Add·Delete |
 | `[PROXY]` | Proxy connection and PDU |
+| `[GATT]` | Custom BLE channel discovery and writes |
 | `[NET]` / `[CACHE]` | Network DB and cache |
 
 **Successful AppKey configuration** should show:
@@ -489,7 +599,7 @@ Filter Logcat by `BleMesh` or `BleMeshNetworkManager`.
 cd example && flutter run
 ```
 
-The home page includes device list, unicast/Vendor control, and a debug log panel; the AppBar group icon opens the group/change-group test page.
+The home page includes device list, unicast/Vendor control, and a debug log panel; the AppBar group icon opens the group/change-group test page. The **node control page** shows device info, model configuration, Proxy connect/disconnect, **custom effect preview** (custom GATT bin / opcode), and node reset.
 
 ## Platform Configuration
 
@@ -532,9 +642,14 @@ Minimum system version: **iOS 13.0**.
 | `connectToProxy()` / `disconnectFromProxy()` | Proxy connection (Bluetooth address string) |
 | `getConnectionState()` | Query current Proxy connection state (no event stream needed) |
 | `isProxyReady()` | Check if Proxy for a given Bluetooth address is ready (notifications on, PDUs can flow) |
+| `configureCustomBleChannel()` | Register custom Service / write (and optional notify) characteristic UUIDs |
+| `isCustomBleReady()` | Whether the custom write characteristic has been discovered and is usable |
+| `writeCustomBleData()` | Single-packet write to custom characteristic (raw bytes / opcodes) |
+| `transferCustomBleData()` | MTU-chunked bin transfer with write-with-response |
 | `distributeAppKey()` | Manually trigger AppKey configuration (for retry on failure) |
 | `sendGenericOnOff()` / `sendGenericLevel()` | SIG model control |
 | `getNodes()` / `deleteNode()` | Node management |
+| `fetchReportedModels()` | Request Composition Data from device and return reported element/model list |
 | `createGroup()` / `deleteGroup()` / `ensureGroup()` | Group management |
 | `addModelSubscription()` / `removeModelSubscription()` | Subscription Add / Delete |
 | `setModelPublication()` | Publication Set (`publishAddress: 0` clears publication) |
@@ -545,7 +660,7 @@ Minimum system version: **iOS 13.0**.
 | `configureDefaultSyncSlave()` / `promoteSyncModelToMaster()` / `demoteSyncModelToSlave()` | Sync role switching helpers |
 | `getNodeByAddress()` / `getNodeByUuid()` / `getGroupByAddress()` | Node and group queries |
 | `exportNetworkJson()` / `importNetworkJson()` | Network backup |
-| `sendVendorMessage()` / `setMasterSlaveRole()` / `setPlayMode()` | Vendor control |
+| `sendVendorMessage()` | Vendor control |
 
 ### Main Event Streams
 
@@ -556,6 +671,9 @@ Minimum system version: **iOS 13.0**.
 | `nodeAdded` | New node added |
 | `configurationState` | Post-provisioning AppKey / Bind progress (**must listen before control**) |
 | `connectionState` | Proxy connection state |
+| `customBleChannelReady` | Custom GATT write characteristic discovered and ready |
+| `customBleTransferProgress` | Chunked bin transfer progress (`bytesSent` / `totalBytes`) |
+| `customBleDataReceived` | Bytes received on custom notify characteristic |
 | `nodeDeleted` | Node deletion complete |
 | `networkLoaded` / `networkUpdated` | Network loaded/changed |
 | `meshMessages` / `vendorMessages` | Received status messages |
@@ -577,8 +695,10 @@ Common states are listed below; see the full `MeshConfigurationState` enum for g
 |------|------|
 | `BleMeshDevice` | Unprovisioned device from scan |
 | `MeshNode` | Provisioned node (includes `unicastAddress`, `macAddress`, element list) |
-| `MeshElement` | Node element |
-| `MeshGroup` | Group (multicast address) |
+| `MeshElement` | Node element (includes per-model `publishAddress` / `subscriptionAddresses` when available) |
+| `MeshModelConfig` | Model publication and subscription snapshot |
+| `MeshGroup` | Group (multicast address; includes `boundDeviceCount` for subscribed nodes) |
+| `CustomBleTransferProgress` | Custom GATT bin transfer progress |
 | `MeshNetworkInfo` | Network summary (NetKey, AppKey, IV Index, etc.) |
 | `MeshConfigurationStatus` | Configuration phase status |
 | `MeshMessageStatus` | SIG model status response |
@@ -610,6 +730,9 @@ Common states are listed below; see the full `MeshConfigurationState` enum for g
 - **`macAddress` recovery**: Usually restored from persisted mapping after cold start; if the system cannot retrieve the peripheral, re-scan is required.
 - **Manual Proxy Filter API**: Dart layer does not yet expose `setProxyFilterType` and similar interfaces; iOS internally uses Nordic Proxy Filter during auto-configuration.
 - **Multiple Proxy nodes**: Only one Proxy GATT connection is maintained at a time; multicast is forwarded through the current Proxy.
+- **Custom BLE vs third-party BLE plugins**: Custom GATT reuses the Proxy connection. Using `flutter_blue_plus` (or similar) to connect to the **same** device while Proxy is active usually fails or drops Mesh. Disconnect Proxy first if you must use a separate BLE plugin.
+- **Custom BLE protocol**: The plugin only writes bytes to your characteristics; packet layout, ACK, and CRC are defined by your firmware.
+- **Model config overlay**: Publication/subscription configured through this plugin may be merged with local cache when Composition Data is refreshed; avoid calling `fetchReportedModels()` on every screen enter if you rely on persisted subscription UI state.
 
 ## License
 

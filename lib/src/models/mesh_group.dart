@@ -10,6 +10,7 @@ class MeshGroup {
     required this.address,
     required this.name,
     this.parentAddress,
+    this.boundDeviceCount = 0,
   });
 
   /// 分组地址，有效范围为 0xC000 - 0xFEFF（固定组）或虚拟地址。
@@ -21,12 +22,16 @@ class MeshGroup {
   /// 父分组地址（用于嵌套分组），没有父分组时为 null。
   final int? parentAddress;
 
+  /// 已订阅该组地址的设备（节点）数量。
+  final int boundDeviceCount;
+
   /// 从 Map 构造 [MeshGroup]（原生层返回的数据）。
   factory MeshGroup.fromMap(Map<dynamic, dynamic> map) {
     return MeshGroup(
       address: map['address'] as int? ?? 0,
       name: map['name'] as String? ?? '未知分组',
       parentAddress: map['parentAddress'] as int?,
+      boundDeviceCount: map['boundDeviceCount'] as int? ?? 0,
     );
   }
 
@@ -35,6 +40,7 @@ class MeshGroup {
         'address': address,
         'name': name,
         'parentAddress': parentAddress,
+        'boundDeviceCount': boundDeviceCount,
       };
 
   /// 格式化地址为十六进制字符串（例如 "0xC000"）。

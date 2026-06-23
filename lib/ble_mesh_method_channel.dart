@@ -166,6 +166,14 @@ class MethodChannelBleMesh extends BleMeshPlatform {
   }
 
   @override
+  Future<Map<dynamic, dynamic>> fetchReportedModels(int unicastAddress) async {
+    final result = await methodChannel.invokeMethod<Map>('fetchReportedModels', {
+      'unicastAddress': unicastAddress,
+    });
+    return result?.cast<dynamic, dynamic>() ?? <dynamic, dynamic>{};
+  }
+
+  @override
   Future<void> deleteNode(int unicastAddress) async {
     await methodChannel.invokeMethod<void>('deleteNode', {
       'unicastAddress': unicastAddress,
@@ -275,6 +283,41 @@ class MethodChannelBleMesh extends BleMeshPlatform {
       'appKeyIndex': appKeyIndex,
       'publishTtl': publishTtl,
       'publishPeriod': publishPeriod,
+    });
+  }
+
+  @override
+  Future<void> configureCustomBleChannel({
+    required String serviceUuid,
+    required String writeCharacteristicUuid,
+    String? notifyCharacteristicUuid,
+  }) async {
+    await methodChannel.invokeMethod<void>('configureCustomBleChannel', {
+      'serviceUuid': serviceUuid,
+      'writeCharacteristicUuid': writeCharacteristicUuid,
+      ...?notifyCharacteristicUuid == null
+          ? null
+          : {'notifyCharacteristicUuid': notifyCharacteristicUuid},
+    });
+  }
+
+  @override
+  Future<bool> isCustomBleReady() async {
+    final ready = await methodChannel.invokeMethod<bool>('isCustomBleReady');
+    return ready ?? false;
+  }
+
+  @override
+  Future<void> writeCustomBleData(List<int> data) async {
+    await methodChannel.invokeMethod<void>('writeCustomBleData', {
+      'data': data,
+    });
+  }
+
+  @override
+  Future<void> transferCustomBleData(List<int> data) async {
+    await methodChannel.invokeMethod<void>('transferCustomBleData', {
+      'data': data,
     });
   }
 }

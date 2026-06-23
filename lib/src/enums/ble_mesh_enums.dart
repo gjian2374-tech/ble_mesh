@@ -169,6 +169,15 @@ enum MeshEventType {
   /// 收到 Mesh 消息响应。
   meshMessageReceived,
 
+  /// 自定义 BLE 通道已就绪（可与 Proxy 共存）。
+  customBleChannelReady,
+
+  /// 自定义 BLE 数据传输进度。
+  customBleTransferProgress,
+
+  /// 自定义 BLE 通道收到通知数据。
+  customBleDataReceived,
+
   /// 发生错误。
   error;
 
@@ -210,47 +219,6 @@ enum MeshModelMessagingMode {
   /// 是否需要组播地址（订阅或发布时为 true）。
   bool get requiresGroupAddress =>
       this != MeshModelMessagingMode.appKeyOnly;
-}
-
-// ── 主从机角色 ─────────────────────────────────────────────────────────────────
-
-/// 节点的主从机角色（用于 Vendor Model 0x0002，操作码 0x10）。
-enum MeshNodeRole {
-  /// 主机模式：负责控制和同步其他从机。
-  master,
-
-  /// 从机模式：接收主机的控制指令。
-  slave;
-
-  /// 将字节值转换为 [MeshNodeRole]（0x01=主机，0x02=从机）。
-  static MeshNodeRole fromByte(int byte) {
-    return byte == 0x01 ? master : slave;
-  }
-
-  /// 转换为协议字节值。
-  int get byteValue => this == master ? 0x01 : 0x02;
-}
-
-// ── 播放资源类型 ───────────────────────────────────────────────────────────────
-
-/// 播放资源类型（用于 Vendor Model 0x0002，操作码 0x11，byte0）。
-enum SourceType {
-  /// SD 卡资源（0x01）。
-  sdCard,
-
-  /// 算法资源（0x02）。
-  algorithm;
-
-  /// 将字节值转换为 [SourceType]。
-  static SourceType fromByte(int byte) {
-    return byte == 0x01 ? sdCard : algorithm;
-  }
-
-  /// 转换为协议字节值。
-  int get byteValue => this == sdCard ? 0x01 : 0x02;
-
-  /// 人类可读名称。
-  String get displayName => this == sdCard ? 'SD 卡资源' : '算法资源';
 }
 
 // ── 收到的 Mesh 消息的模型类型 ─────────────────────────────────────────────────
