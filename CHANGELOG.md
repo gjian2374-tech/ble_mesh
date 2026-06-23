@@ -1,4 +1,4 @@
-## 0.0.1
+## 1.0.0
 
 * Initial release.
 * PB-GATT provisioning and automatic AppKey distribution on Android and iOS.
